@@ -66,6 +66,10 @@ class BudgetLedger:
             self.unknown_usage += 1
         return cost
 
+    def release(self, reservation: Reservation) -> None:
+        with self._lock:
+            self._release(reservation)
+
     def _release(self, reservation: Reservation) -> None:
         if reservation.settled:
             raise ValueError("reservation already settled")

@@ -1,16 +1,37 @@
 import ast
+import json
+import os
 import re
 import shutil
 import tempfile
+import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from harness.contracts import SolveResult, TaskSpec
 from harness.llm_client import LLMClient, LLMError, LLMUnavailable
-from harness.runtime import run_python_tests
+from harness.runtime import run_python, run_python_tests
 from harness.scheduler import FallbackUnavailable
 from harness.solvers.coding import _digest, _locate, _write_atomic
 from harness.task_io import resolve_inside
+
+TRAJECTORY_ENV = "HARNESS_TRAJECTORIES"
+_TRACE_LOCK = threading.Lock()
+
+
+def trace(event: dict) -> None:
+    directory = os.environ.get(TRAJECTORY_ENV)
+    if not directory:
+        return
+    try:
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"time": round(time.time(), 3), **event}, ensure_ascii=False)
+        with _TRACE_LOCK, (Path(directory) / "trajectory.jsonl").open("a", encoding="utf-8") as file:
+            file.write(line + "\n")
+    except OSError:
+        pass
+
 
 SCRIPT_NAME = "llm_solution.py"
 SCRIPT_TIMEOUT = 10.0
@@ -24,9 +45,11 @@ _BOILERPLATE = re.compile(
 _FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
 
 SCRIPT_SYSTEM = (
-    "Write a minimal Python 3 script (standard library only, no comments) that solves the task. "
-    "Input files are in the current directory. Print only the final answer. "
-    "If the files do not contain what is needed to answer exactly, print UNSOLVABLE. Output only code."
+    "If the task or its files lack something needed for an exact answer (a quantity given only vaguely such as "
+    "'some' or 'several', a missing file, column, record or fact), reply with only the word UNSOLVABLE. "
+    "Otherwise write a minimal Python 3 script (standard library only, no comments) that solves the task: input "
+    "files are in the current directory; handle every sentence in order and apply rounding exactly as stated; "
+    "print only the final answer. Output only code."
 )
 CODING_SYSTEM = (
     "Fix the bugs in the module so that the tests pass; do not change the tests. "
@@ -138,6 +161,23 @@ def _splice(module: str, patch: str) -> str | None:
     return result
 
 
+_DUNDER_GAMING = {"__eq__", "__ne__", "__hash__", "__bool__", "__lt__", "__le__", "__gt__", "__ge__",
+                  "__contains__", "__len__", "__getattr__", "__getattribute__", "__instancecheck__"}
+
+
+def _games_tests(original: str, patched: str) -> str | None:
+    def shape(source: str) -> tuple[set[str], set[str]]:
+        tree = ast.parse(source)
+        classes = {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+        dunders = {node.name for node in ast.walk(tree)
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in _DUNDER_GAMING}
+        return classes, dunders
+    old_classes, old_dunders = shape(original)
+    new_classes, new_dunders = shape(patched)
+    added = sorted((new_classes - old_classes) | (new_dunders - old_dunders))
+    return f"fix adds {', '.join(added)}" if added else None
+
+
 def _failure_summary(output: str, limit: int = 1500) -> str:
     keep = [
         line for line in output.splitlines()
@@ -150,20 +190,35 @@ class LLMFallback:
     def __init__(self, client: LLMClient, models: Models = Models()):
         self.client = client
         self.models = models
+        self._event: dict = {}
 
     async def __call__(self, task: TaskSpec, previous: SolveResult, *, attempt: int, timeout: float) -> SolveResult:
         strong = attempt >= 2
         model = self.models.strong if strong else self.models.fast
         max_tokens = self.models.strong_max_tokens if strong else self.models.fast_max_tokens
         feedback = previous.detail[:400] if attempt >= 2 else ""
+        self._event = {"task": task.task_id, "type": task.task_type, "attempt": attempt, "model": model}
         try:
             if task.task_type == "coding":
-                return await self._coding(task, model, max_tokens, timeout, feedback)
-            return await self._script(task, model, max_tokens, timeout, feedback, final=strong)
+                result = await self._coding(task, model, max_tokens, timeout, feedback)
+            else:
+                result = await self._script(task, model, max_tokens, timeout, feedback, final=strong)
         except LLMUnavailable as error:
+            trace({**self._event, "status": "UNAVAILABLE", "detail": str(error)[:300]})
             raise FallbackUnavailable(str(error)) from error
         except LLMError as error:
-            return SolveResult.unsupported(f"LLM request failed: {error}")
+            result = SolveResult.unsupported(f"LLM request failed: {error}")
+        trace({**self._event, "status": result.status.value, "answer": result.answer, "detail": result.detail[:500]})
+        return result
+
+    async def _chat(self, model: str, system: str, prompt: str, max_tokens: int, timeout: float, label: str):
+        reply = await self.client.chat(
+            model, [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            max_tokens=max_tokens, timeout=timeout, label=label,
+        )
+        self._event.update(prompt=prompt, reply=reply.content, cost=reply.cost, input_tokens=reply.prompt_tokens,
+                           output_tokens=reply.completion_tokens, seconds=round(reply.seconds, 2))
+        return reply
 
     async def _script(self, task, model, max_tokens, timeout, feedback, *, final) -> SolveResult:
         prompt = question(task.instruction)
@@ -172,17 +227,21 @@ class LLMFallback:
             prompt += "\n\n" + context
         if feedback:
             prompt += f"\n\nA previous attempt failed: {feedback}"
-        reply = await self.client.chat(
-            model, [{"role": "system", "content": SCRIPT_SYSTEM}, {"role": "user", "content": prompt}],
-            max_tokens=max_tokens, timeout=max(1.0, timeout - SCRIPT_TIMEOUT), label=task.task_id,
-        )
+        reply = await self._chat(model, SCRIPT_SYSTEM, prompt, max_tokens, max(1.0, timeout - SCRIPT_TIMEOUT),
+                                 task.task_id)
+        if reply.content.strip().strip("`").strip().upper().rstrip(".") == "UNSOLVABLE":
+            if final:
+                return SolveResult.unsolvable(f"{model} finds information missing for an exact answer")
+            return SolveResult.unsupported(f"{model} replied UNSOLVABLE")
         code = extract_code(reply.content)
         if not code:
             return SolveResult.unsupported(f"{model} returned no code")
         with tempfile.TemporaryDirectory(prefix="jiuwen-llm-") as scratch:
             root = _scratch_copy(task, Path(scratch))
-            (root / SCRIPT_NAME).write_text(code, encoding="utf-8")
-            result = run_python_tests(replace(task, workspace=root), SCRIPT_NAME, timeout=SCRIPT_TIMEOUT)
+            script = Path(scratch) / SCRIPT_NAME
+            script.write_text(code, encoding="utf-8")
+            result = run_python(script, cwd=root, timeout=SCRIPT_TIMEOUT)
+        self._event["script_output"] = result.output[-500:]
         if not result.passed:
             reason = "timed out" if result.timed_out else _failure_summary(result.output, 300) or "failed"
             return SolveResult.unsupported(f"{model} script {reason}")
@@ -216,13 +275,14 @@ class LLMFallback:
             )
             if feedback:
                 prompt += f"\n\nA previous fix failed: {feedback}"
-            reply = await self.client.chat(
-                model, [{"role": "system", "content": CODING_SYSTEM}, {"role": "user", "content": prompt}],
-                max_tokens=max_tokens, timeout=max(1.0, timeout - 2 * SCRIPT_TIMEOUT), label=task.task_id,
-            )
+            reply = await self._chat(model, CODING_SYSTEM, prompt, max_tokens,
+                                     max(1.0, timeout - 2 * SCRIPT_TIMEOUT), task.task_id)
             patched = _splice(original, extract_code(reply.content))
             if patched is None:
                 return SolveResult.unsupported(f"{model} reply has no usable definitions")
+            gaming = _games_tests(original, patched)
+            if gaming:
+                return SolveResult.unsupported(f"{model} {gaming}; rejected as test gaming")
             resolve_inside(root, target).write_text(patched, encoding="utf-8")
             check = run_python_tests(replace(task, workspace=root), script, timeout=SCRIPT_TIMEOUT)
             if not check.passed:

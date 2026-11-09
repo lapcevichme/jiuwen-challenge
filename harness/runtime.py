@@ -48,11 +48,16 @@ def _stop_test(process: subprocess.Popen, env: dict[str, str]) -> None:
 def run_python_tests(task: TaskSpec, script: str | Path, *, timeout: float) -> TestResult:
     if task.workspace is None:
         raise ValueError("the task has no workspace")
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("timeout must be finite and positive")
     test_path = resolve_inside(task.workspace, script)
     if not test_path.is_file() or test_path.suffix != ".py":
         raise ValueError("expected an existing Python test script inside workspace")
+    return run_python(test_path, cwd=task.workspace, timeout=timeout)
+
+
+def run_python(script: Path, *, cwd: Path, timeout: float) -> TestResult:
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be finite and positive")
+    test_path = script
 
     env = {"PYTHONIOENCODING": "utf-8"}
     if os.name == "nt" and "SystemRoot" in os.environ:
@@ -61,7 +66,7 @@ def run_python_tests(task: TaskSpec, script: str | Path, *, timeout: float) -> T
         env.update(TMP=scratch, TEMP=scratch, TMPDIR=scratch)
         process = subprocess.Popen(
             [sys.executable, "-B", "-s", str(test_path)],
-            cwd=task.workspace, env=env, stdin=subprocess.DEVNULL,
+            cwd=cwd, env=env, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             start_new_session=os.name == "posix",
         )
