@@ -14,9 +14,12 @@ from harness.scheduler import run_tasks
 from harness.task_io import load_task, resolve_inside
 
 LOG = logging.getLogger("harness")
+DEFAULT_BUDGET = 100_000
 
 
 def build_registry() -> dict[str, Solver]:
+    if os.environ.get("HARNESS_DETERMINISTIC") == "0":
+        return {}
     from harness.solvers import data_analysis, math, search
 
     registry = {"math": math.solve, "data_analysis": data_analysis.solve, "search": search.solve}
@@ -60,11 +63,38 @@ def _configure_sdk() -> None:
     })
 
 
+def build_fallback():
+    base_url, api_key = os.environ.get("LLM_BASE_URL"), os.environ.get("LLM_API_KEY")
+    if not base_url or not api_key or os.environ.get("HARNESS_LLM") == "0":
+        LOG.warning("LLM fallback disabled")
+        return None, None
+    from harness.budget import BudgetLedger
+    from harness.llm_client import LLMClient
+    from harness.solvers.llm import LLMFallback, Models
+
+    try:
+        budget = float(os.environ.get("BUDGET") or DEFAULT_BUDGET)
+        ledger = BudgetLedger(budget)
+    except ValueError:
+        LOG.warning("invalid BUDGET %r; using %d", os.environ.get("BUDGET"), DEFAULT_BUDGET)
+        ledger = BudgetLedger(DEFAULT_BUDGET)
+    models = Models(
+        fast=os.environ.get("LLM_MODEL") or Models.fast,
+        strong=os.environ.get("LLM_STRONG_MODEL") or Models.strong,
+    )
+    return LLMFallback(LLMClient(base_url, api_key, ledger), models), ledger
+
+
 async def _run(root: Path, deadline: float) -> None:
     from harness.workflow import SolverWorkflow
 
     workflow = SolverWorkflow(build_registry())
-    await run_tasks(_tasks(root), workflow.solve, deadline=deadline)
+    fallback, ledger = build_fallback()
+    try:
+        await run_tasks(_tasks(root), workflow.solve, deadline=deadline, fallback=fallback)
+    finally:
+        if ledger is not None:
+            LOG.info("%s", ledger.summary())
 
 
 def main(argv: list[str] | None = None) -> int:
