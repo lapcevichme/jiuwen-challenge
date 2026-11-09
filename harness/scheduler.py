@@ -27,6 +27,7 @@ class ScheduleLimits:
     max_fallback_attempts: int = 2
     fallback_timeout: float = 45.0
     fallback_reserve: float = 60.0
+    last_resort_reserve: float = 75.0
 
     def __post_init__(self) -> None:
         if type(self.max_fallback_attempts) is not int or self.max_fallback_attempts < 0:
@@ -35,6 +36,8 @@ class ScheduleLimits:
             raise ValueError("fallback_timeout must be finite and positive")
         if not math.isfinite(self.fallback_reserve) or self.fallback_reserve < 0:
             raise ValueError("fallback_reserve must be finite and non-negative")
+        if not math.isfinite(self.last_resort_reserve) or self.last_resort_reserve < 0:
+            raise ValueError("last_resort_reserve must be finite and non-negative")
 
 
 def _record(task: TaskSpec, result: SolveResult, phase: str) -> None:
@@ -52,6 +55,7 @@ async def run_tasks(
     *,
     deadline: float,
     fallback: FallbackSolver | None = None,
+    last_resort: Callable[[TaskSpec], Awaitable[SolveResult]] | None = None,
     limits: ScheduleLimits = ScheduleLimits(),
 ) -> None:
     pending: list[tuple[TaskSpec, SolveResult]] = []
@@ -69,16 +73,26 @@ async def run_tasks(
         if result.status is SolveStatus.UNSUPPORTED:
             pending.append((task, result))
 
-    if fallback is None:
-        return
+    pending.sort(key=lambda entry: -entry[0].reward)
+    unresolved = [task for task, _ in pending]
+    if fallback is not None:
+        unresolved = await _fallback_pass(pending, fallback, deadline=deadline, limits=limits)
+    if last_resort is not None:
+        await _last_resort_pass(unresolved, last_resort, deadline=deadline, limits=limits)
 
+
+async def _fallback_pass(
+    pending: list[tuple[TaskSpec, SolveResult]], fallback: FallbackSolver, *, deadline: float, limits: ScheduleLimits,
+) -> list[TaskSpec]:
     cutoff = deadline - limits.fallback_reserve
-    for task, previous in sorted(pending, key=lambda entry: -entry[0].reward):
+    unresolved: list[TaskSpec] = []
+    for index, (task, previous) in enumerate(pending):
+        final = False
         for attempt in range(1, limits.max_fallback_attempts + 1):
             timeout = min(limits.fallback_timeout, cutoff - time.monotonic())
             if timeout <= 0:
                 LOG.warning("fallback deadline reached")
-                return
+                return unresolved + [task for task, _ in pending[index:]]
             try:
                 async with asyncio.timeout(timeout):
                     result = await fallback(task, previous, attempt=attempt, timeout=timeout)
@@ -86,7 +100,7 @@ async def run_tasks(
                     raise TypeError("fallback solver must return SolveResult")
             except FallbackUnavailable as error:
                 LOG.warning("fallback stopped: %r", str(error)[:512])
-                return
+                return unresolved + [task for task, _ in pending[index:]]
             except TimeoutError:
                 previous = SolveResult.error("fallback attempt timed out")
                 _record(task, previous, f"fallback #{attempt}")
@@ -95,5 +109,26 @@ async def run_tasks(
                 result = SolveResult.error(f"{type(error).__name__}: {error}")
             _record(task, result, f"fallback #{attempt}")
             if result.status is not SolveStatus.UNSUPPORTED:
+                final = result.status in (SolveStatus.SOLVED, SolveStatus.UNSOLVABLE)
                 break
             previous = result
+        if not final:
+            unresolved.append(task)
+    return unresolved
+
+
+async def _last_resort_pass(
+    tasks: list[TaskSpec], last_resort: Callable[[TaskSpec], Awaitable[SolveResult]], *,
+    deadline: float, limits: ScheduleLimits,
+) -> None:
+    for task in tasks:
+        if deadline - time.monotonic() < limits.last_resort_reserve:
+            LOG.warning("last-resort deadline reached")
+            return
+        try:
+            result = await last_resort(task)
+            if not isinstance(result, SolveResult):
+                raise TypeError("last-resort solver must return SolveResult")
+        except Exception as error:
+            result = SolveResult.error(f"{type(error).__name__}: {error}")
+        _record(task, result, "last resort")

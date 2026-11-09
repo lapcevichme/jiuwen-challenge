@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import importlib.util
 import logging
 import os
 import sys
@@ -20,14 +19,18 @@ DEFAULT_BUDGET = 100_000
 def build_registry() -> dict[str, Solver]:
     if os.environ.get("HARNESS_DETERMINISTIC") == "0":
         return {}
-    from harness.solvers import data_analysis, math, search
+    from harness.solvers import coding, data_analysis, math, search
 
-    registry = {"math": math.solve, "data_analysis": data_analysis.solve, "search": search.solve}
-    if importlib.util.find_spec("harness.solvers.coding") is not None:
-        from harness.solvers.coding import solve
+    return {"math": math.solve, "data_analysis": data_analysis.solve, "search": search.solve,
+            "coding": coding.precheck}
 
-        registry["coding"] = solve
-    return registry
+
+def build_last_resort() -> dict[str, Solver]:
+    if os.environ.get("HARNESS_DETERMINISTIC") == "0":
+        return {}
+    from harness.solvers import coding
+
+    return {"coding": coding.solve}
 
 
 def _tasks(root: Path) -> Iterator[TaskSpec]:
@@ -89,9 +92,12 @@ async def _run(root: Path, deadline: float) -> None:
     from harness.workflow import SolverWorkflow
 
     workflow = SolverWorkflow(build_registry())
+    rescue = build_last_resort()
+    last_resort = SolverWorkflow(rescue).solve if rescue else None
     fallback, ledger = build_fallback()
     try:
-        await run_tasks(_tasks(root), workflow.solve, deadline=deadline, fallback=fallback)
+        await run_tasks(_tasks(root), workflow.solve, deadline=deadline, fallback=fallback,
+                        last_resort=last_resort)
     finally:
         if ledger is not None:
             LOG.info("%s", ledger.summary())
