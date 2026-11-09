@@ -1,0 +1,564 @@
+import ast
+import codecs
+import copy
+import hashlib
+import os
+import re
+import shutil
+import tempfile
+import time
+from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from itertools import combinations
+from pathlib import Path
+from queue import SimpleQueue
+
+from harness.contracts import SolveResult, TaskSpec
+from harness.runtime import TestResult, run_python_tests
+from harness.task_io import resolve_inside
+
+TIME_LIMIT = 120.0
+MAX_ROUNDS = 8
+MAX_PAIR_RUNS = 800
+WORKERS = max(1, min(4, os.cpu_count() or 1))
+
+_SCRIPT = re.compile(r"\bRun `(?:python3?\s+)?(?P<script>[\w./-]+\.py)`")
+_TARGET = re.compile(r"\bFix (?:the )?bugs? in `?(?P<target>[\w./-]+\.py)`?", re.IGNORECASE)
+_FAILURE = re.compile(r"^(?:FAIL|ERROR): (\S+) \(([^)\s]*)\)\s*$", re.MULTILINE)
+_RAN = re.compile(r"^Ran [0-9]+ tests? in ", re.MULTILINE)
+
+Failures = frozenset[str] | None
+
+_ARITH_FAMILIES = (
+    (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow),
+    (ast.BitAnd, ast.BitOr, ast.BitXor, ast.LShift, ast.RShift),
+)
+_ARITH_PARTNERS = {
+    ast.Add: {ast.Sub}, ast.Sub: {ast.Add}, ast.Mult: {ast.Div}, ast.Div: {ast.Mult, ast.FloorDiv},
+    ast.FloorDiv: {ast.Div, ast.Mod}, ast.Mod: {ast.FloorDiv}, ast.Pow: {ast.Mult},
+    ast.BitAnd: {ast.BitOr}, ast.BitOr: {ast.BitAnd}, ast.LShift: {ast.RShift}, ast.RShift: {ast.LShift},
+}
+_COMPARE_FAMILIES = (
+    (ast.Lt, ast.LtE, ast.Gt, ast.GtE), (ast.Eq, ast.NotEq), (ast.In, ast.NotIn), (ast.Is, ast.IsNot),
+)
+_COMPARE_PARTNERS = {
+    ast.Lt: ast.Gt, ast.Gt: ast.Lt, ast.LtE: ast.GtE, ast.GtE: ast.LtE, ast.Eq: ast.NotEq,
+    ast.NotEq: ast.Eq, ast.In: ast.NotIn, ast.NotIn: ast.In, ast.Is: ast.IsNot, ast.IsNot: ast.Is,
+}
+_BUILTIN_FAMILIES = (("min", "max"), ("any", "all"), ("sorted", "reversed"))
+_METHOD_FAMILIES = (
+    ("lower", "upper"), ("startswith", "endswith"), ("find", "rfind"), ("index", "rindex"),
+    ("split", "rsplit"), ("strip", "lstrip", "rstrip"), ("keys", "values", "items"),
+)
+_UNWRAP = {"sorted", "reversed", "list", "set", "tuple", "abs", "int", "float", "str", "round"}
+_STRINGS = ("", " ", ",", ", ", "\n")
+_DELETABLE = (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Expr, ast.If, ast.Break, ast.Continue)
+_LOOSE = (ast.BinOp, ast.BoolOp, ast.Compare, ast.UnaryOp, ast.IfExp, ast.Lambda, ast.NamedExpr)
+
+
+@dataclass(frozen=True)
+class _Edit:
+    start: int
+    end: int
+    text: bytes
+    priority: int
+    unit: str
+    label: str
+
+
+def _failures(result: TestResult) -> Failures:
+    if result.passed:
+        return frozenset()
+    if result.timed_out or not _RAN.search(result.output):
+        return None
+    found = frozenset(f"{name} ({where})" for name, where in _FAILURE.findall(result.output))
+    return found or None
+
+
+def _better(new: Failures, old: Failures) -> bool:
+    if new is None:
+        return False
+    return old is None or new < old
+
+
+def _rank(failures: Failures) -> float:
+    return float("inf") if failures is None else len(failures)
+
+
+def _apply(source: bytes, edits: Iterable[_Edit]) -> bytes:
+    for edit in sorted(edits, key=lambda item: item.start, reverse=True):
+        source = source[:edit.start] + edit.text + source[edit.end:]
+    return source
+
+
+def _disjoint(edits: Iterable[_Edit]) -> bool:
+    spans = sorted((edit.start, edit.end) for edit in edits)
+    return all(left[1] <= right[0] for left, right in zip(spans, spans[1:]))
+
+
+def _with(node: ast.AST, **changes) -> ast.AST:
+    clone = copy.copy(node)
+    for name, value in changes.items():
+        setattr(clone, name, value)
+    return clone
+
+
+def _shifts(node: ast.expr) -> Iterator[ast.expr]:
+    unit_offset = isinstance(node, ast.BinOp) and isinstance(node.right, ast.Constant) and node.right.value == 1
+    for op in (ast.Add, ast.Sub):
+        cancels = unit_offset and isinstance(node.op, ast.Sub if op is ast.Add else ast.Add)
+        if not cancels:
+            yield ast.BinOp(node, op(), ast.Constant(1))
+
+
+_PRECEDENCE = (
+    (ast.Add, ast.Sub), (ast.Mult, ast.Div, ast.FloorDiv, ast.Mod), (ast.BitAnd,), (ast.BitOr,), (ast.BitXor,),
+    (ast.LShift, ast.RShift), (ast.Pow,),
+)
+
+
+def _same_precedence(original: ast.AST, replacement: ast.AST) -> bool:
+    if isinstance(original, ast.Compare) and isinstance(replacement, ast.Compare):
+        return True
+    if isinstance(original, ast.BinOp) and isinstance(replacement, ast.BinOp):
+        return any(isinstance(original.op, group) and isinstance(replacement.op, group) for group in _PRECEDENCE)
+    return False
+
+
+def _text(node: ast.AST, original: ast.AST) -> bytes:
+    text = ast.unparse(node)
+    negative = isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and node.value < 0
+    if (isinstance(node, _LOOSE) and not _same_precedence(original, node)) or negative:
+        text = f"({text})"
+    return text.encode("utf-8")
+
+
+def _operator_swaps(op: ast.AST) -> Iterator[tuple[ast.AST, int]]:
+    kind = type(op)
+    for family in _ARITH_FAMILIES:
+        if kind in family:
+            for other in family:
+                if other is not kind:
+                    yield other(), 0 if other in _ARITH_PARTNERS.get(kind, ()) else 1
+
+
+def _variants(node: ast.AST, parent: ast.AST | None) -> Iterator[tuple[ast.AST | bytes, int]]:
+    if isinstance(node, ast.BinOp):
+        identity = isinstance(node.right, ast.Constant) and node.right.value == 1
+        for op, priority in _operator_swaps(node.op):
+            if not (identity and isinstance(op, (ast.Mult, ast.Div, ast.FloorDiv, ast.Pow))):
+                yield _with(node, op=op), priority
+        if isinstance(node.op, (ast.Add, ast.Sub)) and isinstance(node.right, ast.Constant):
+            yield node.left, 2
+        if isinstance(node.op, ast.Add) and isinstance(node.left, ast.Constant):
+            yield node.right, 2
+        if isinstance(node.op, (ast.Sub, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow)):
+            yield _with(node, left=node.right, right=node.left), 3
+    elif isinstance(node, ast.AugAssign):
+        for op, priority in _operator_swaps(node.op):
+            yield _with(node, op=op), priority
+    elif isinstance(node, ast.Compare):
+        for index, op in enumerate(node.ops):
+            for family in _COMPARE_FAMILIES:
+                if type(op) in family:
+                    for other in family:
+                        if other is not type(op):
+                            ops = list(node.ops)
+                            ops[index] = other()
+                            yield _with(node, ops=ops), 0 if _COMPARE_PARTNERS[type(op)] is other else 1
+    elif isinstance(node, ast.BoolOp):
+        yield _with(node, op=ast.Or() if isinstance(node.op, ast.And) else ast.And()), 0
+    elif isinstance(node, ast.UnaryOp):
+        if isinstance(node.op, ast.Not):
+            yield node.operand, 1
+        elif isinstance(node.op, ast.USub):
+            yield node.operand, 2
+    elif isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, bool):
+            yield ast.Constant(not value), 0
+        elif isinstance(value, int):
+            for other in dict.fromkeys((value + 1, value - 1, 0, 1)):
+                if other != value:
+                    yield ast.Constant(other), 2
+        elif isinstance(value, str) and value in _STRINGS:
+            for other in _STRINGS:
+                if other != value:
+                    yield ast.Constant(other), 2
+    elif isinstance(node, ast.Call):
+        yield from _call_variants(node)
+    elif isinstance(node, ast.Subscript):
+        yield from _subscript_variants(node)
+
+    if isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)) and node is parent.test:
+        if not isinstance(node, (ast.Compare, ast.UnaryOp, ast.BoolOp)):
+            yield ast.UnaryOp(ast.Not(), node), 2
+    if isinstance(node, _DELETABLE) and not isinstance(parent, ast.Module):
+        yield b"pass", 3
+
+
+def _call_variants(node: ast.Call) -> Iterator[tuple[ast.AST, int]]:
+    func = node.func
+    if isinstance(func, ast.Name):
+        for family in _BUILTIN_FAMILIES:
+            if func.id in family:
+                for other in family:
+                    if other != func.id:
+                        yield _with(node, func=ast.Name(other, ast.Load())), 0
+        if func.id in _UNWRAP and len(node.args) == 1 and not node.keywords:
+            yield node.args[0], 3
+        if func.id == "range":
+            for index, arg in enumerate(node.args):
+                if not isinstance(arg, ast.Constant):
+                    for shifted in _shifts(arg):
+                        args = list(node.args)
+                        args[index] = shifted
+                        yield _with(node, args=args), 2
+    elif isinstance(func, ast.Attribute):
+        for family in _METHOD_FAMILIES:
+            if func.attr in family:
+                for other in family:
+                    if other != func.attr:
+                        yield _with(node, func=_with(func, attr=other)), 0 if len(family) == 2 else 1
+    name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+    if name in ("sorted", "sort"):
+        keywords = [keyword for keyword in node.keywords if keyword.arg != "reverse"]
+        if len(keywords) == len(node.keywords):
+            keywords.append(ast.keyword("reverse", ast.Constant(True)))
+        yield _with(node, keywords=keywords), 1
+
+
+def _subscript_variants(node: ast.Subscript) -> Iterator[tuple[ast.AST, int]]:
+    index = node.slice
+    if isinstance(index, ast.Slice):
+        for field in ("lower", "upper"):
+            bound = getattr(index, field)
+            if bound is not None and not isinstance(bound, ast.Constant):
+                for shifted in _shifts(bound):
+                    yield _with(node, slice=_with(index, **{field: shifted})), 2
+        if index.step is None and (index.lower is None) != (index.upper is None):
+            yield _with(node, slice=_with(index, lower=index.upper, upper=index.lower)), 2
+        if index.step is not None:
+            yield _with(node, slice=_with(index, step=None)), 2
+        else:
+            yield _with(node, slice=_with(index, step=ast.UnaryOp(ast.USub(), ast.Constant(1)))), 3
+    elif not isinstance(index, (ast.Constant, ast.Tuple)):
+        for shifted in _shifts(index):
+            yield _with(node, slice=shifted), 2
+
+
+def _name_swaps(unit: ast.AST) -> Iterator[tuple[ast.Name, ast.AST, int]]:
+    for function in ast.walk(unit):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        arguments = function.args
+        local = {arg.arg for arg in arguments.posonlyargs + arguments.args + arguments.kwonlyargs}
+        local |= {
+            node.id for node in ast.walk(function)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        }
+        for node in ast.walk(function):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in local:
+                for other in sorted(local - {node.id}):
+                    yield node, ast.Name(other, ast.Load()), 3
+
+
+def _walk(node: ast.AST, parent: ast.AST | None = None) -> Iterator[tuple[ast.AST, ast.AST | None]]:
+    yield node, parent
+    for child in ast.iter_child_nodes(node):
+        if not isinstance(child, ast.JoinedStr):
+            yield from _walk(child, node)
+
+
+def _units(tree: ast.Module) -> dict[str, list[ast.stmt]]:
+    units: dict[str, list[ast.stmt]] = {}
+    for statement in tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            units[statement.name] = [statement]
+        elif not isinstance(statement, (ast.Import, ast.ImportFrom)) and not (
+            isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+        ):
+            units.setdefault("<module>", []).append(statement)
+    return units
+
+
+def _edits(source: bytes, units: dict[str, list[ast.stmt]], names: Iterable[str]) -> list[_Edit]:
+    starts = [0]
+    for line in source.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+
+    def span(node: ast.AST) -> tuple[int, int] | None:
+        if getattr(node, "end_col_offset", None) is None:
+            return None
+        return starts[node.lineno - 1] + node.col_offset, starts[node.end_lineno - 1] + node.end_col_offset
+
+    seen: set[tuple[int, int, bytes]] = set()
+    edits: list[_Edit] = []
+
+    def add(node: ast.AST, replacement: ast.AST | bytes, priority: int, unit: str) -> None:
+        position = span(node)
+        if position is None:
+            return
+        start, end = position
+        text = replacement if isinstance(replacement, bytes) else _text(replacement, node)
+        original = source[start:end]
+        if text == original or (start, end, text) in seen:
+            return
+        seen.add((start, end, text))
+        label = f"line {node.lineno}: {original.decode('utf-8', 'replace')} -> {text.decode('utf-8')}"
+        edits.append(_Edit(start, end, text, priority, unit, label))
+
+    for unit in names:
+        for top in units[unit]:
+            for node, parent in _walk(top):
+                if node is top and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                if not isinstance(getattr(node, "ctx", ast.Load()), ast.Load):
+                    continue
+                for replacement, priority in _variants(node, parent):
+                    add(node, replacement, priority, unit)
+            for node, replacement, priority in _name_swaps(top):
+                add(node, replacement, priority, unit)
+    edits.sort(key=lambda edit: edit.priority)
+    return edits
+
+
+def _suspects(test_source: bytes, module: str, failures: Failures, units: dict[str, list[ast.stmt]]) -> set[str]:
+    everything = set(units)
+    if not failures:
+        return everything
+    try:
+        tree = ast.parse(test_source)
+    except SyntaxError:
+        return everything
+    aliases: set[str] = set()
+    imported: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            aliases |= {alias.asname or alias.name for alias in node.names if alias.name == module}
+        elif isinstance(node, ast.ImportFrom) and node.module == module:
+            imported |= {alias.asname or alias.name: alias.name for alias in node.names}
+    failing = {failure.split(" ", 1)[0] for failure in failures}
+    used: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in failing:
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) and sub.value.id in aliases:
+                    used.add(sub.attr)
+                elif isinstance(sub, ast.Name) and sub.id in imported:
+                    used.add(imported[sub.id])
+    used &= everything
+    if not used:
+        return everything
+    stack = list(used)
+    while stack:
+        references = {
+            node.id for statement in units[stack.pop()] for node in ast.walk(statement) if isinstance(node, ast.Name)
+        }
+        for name in references & everything - used:
+            used.add(name)
+            stack.append(name)
+    if "<module>" in units:
+        used.add("<module>")
+    return used
+
+
+class _Bench:
+    def __init__(self, task: TaskSpec, target: str, script: str, scratch: Path, deadline: float):
+        self.task, self.target, self.script, self.deadline = task, target, script, deadline
+        self.timeout = 10.0
+        self.cache: dict[bytes, Failures] = {}
+        self.runs = 0
+        self.slots: SimpleQueue[Path] = SimpleQueue()
+        for index in range(WORKERS):
+            copy_root = scratch / f"ws{index}"
+            shutil.copytree(task.workspace, copy_root, symlinks=True)
+            self.slots.put(copy_root)
+        self.pool = ThreadPoolExecutor(WORKERS)
+
+    def close(self) -> None:
+        self.pool.shutdown(wait=True, cancel_futures=True)
+
+    def _run(self, source: bytes) -> Failures:
+        if time.monotonic() >= self.deadline:
+            return None
+        try:
+            compile(source, self.target, "exec")
+        except (SyntaxError, ValueError):
+            return None
+        root = self.slots.get()
+        try:
+            resolve_inside(root, self.target).write_bytes(source)
+            result = run_python_tests(replace(self.task, workspace=root), self.script, timeout=self.timeout)
+            self.runs += 1
+            return _failures(result)
+        finally:
+            self.slots.put(root)
+
+    def evaluate(self, sources: list[bytes]) -> list[Failures]:
+        missing = [source for source in dict.fromkeys(sources) if source not in self.cache]
+        for source, failures in zip(missing, self.pool.map(self._run, missing)):
+            if time.monotonic() < self.deadline:
+                self.cache[source] = failures
+        return [self.cache.get(source) for source in sources]
+
+    def calibrate(self, source: bytes) -> Failures:
+        started = time.monotonic()
+        failures = self.evaluate([source])[0]
+        self.timeout = min(10.0, max(2.0, 5 * (time.monotonic() - started) + 1))
+        return failures
+
+
+def _search(bench: _Bench, source: bytes, test_source: bytes, module: str) -> tuple[bytes, list[str]] | None:
+    failures = bench.calibrate(source)
+    applied: list[str] = []
+    for _ in range(MAX_ROUNDS):
+        if failures == frozenset():
+            return source, applied
+        if time.monotonic() >= bench.deadline:
+            return None
+        try:
+            units = _units(ast.parse(source))
+        except SyntaxError:
+            return None
+        suspects = _suspects(test_source, module, failures, units)
+        scopes = [suspects] if suspects == set(units) else [suspects, set(units)]
+        step = None
+        for scope in scopes:
+            edits = _edits(source, units, sorted(scope))
+            step = _best_single(bench, source, failures, edits) or _best_pair(bench, source, failures, edits)
+            if step is not None:
+                break
+        if step is None:
+            return None
+        edits, failures = step
+        source = _apply(source, edits)
+        applied += [edit.label for edit in edits]
+    return (source, applied) if failures == frozenset() else None
+
+
+def _best_single(bench: _Bench, source: bytes, failures: Failures, edits: list[_Edit]):
+    outcomes = bench.evaluate([_apply(source, [edit]) for edit in edits])
+    improving = [(edit, outcome) for edit, outcome in zip(edits, outcomes) if _better(outcome, failures)]
+    if not improving:
+        return None
+    best_edit, best = min(improving, key=lambda item: (_rank(item[1]), item[0].priority))
+    per_unit: dict[str, tuple[_Edit, Failures]] = {}
+    for edit, outcome in improving:
+        current = per_unit.get(edit.unit)
+        if current is None or (_rank(outcome), edit.priority) < (_rank(current[1]), current[0].priority):
+            per_unit[edit.unit] = (edit, outcome)
+    if len(per_unit) > 1:
+        combined = [edit for edit, _ in per_unit.values()]
+        if _disjoint(combined):
+            outcome = bench.evaluate([_apply(source, combined)])[0]
+            if _better(outcome, failures) and _rank(outcome) < _rank(best):
+                return combined, outcome
+    return [best_edit], best
+
+
+def _best_pair(bench: _Bench, source: bytes, failures: Failures, edits: list[_Edit]):
+    by_unit: dict[str, list[_Edit]] = {}
+    for edit in edits:
+        by_unit.setdefault(edit.unit, []).append(edit)
+    pairs = [
+        pair for unit_edits in by_unit.values() for pair in combinations(unit_edits, 2) if _disjoint(pair)
+    ]
+    pairs.sort(key=lambda pair: pair[0].priority + pair[1].priority)
+    chunk = WORKERS * 8
+    for offset in range(0, min(len(pairs), MAX_PAIR_RUNS), chunk):
+        if time.monotonic() >= bench.deadline:
+            return None
+        batch = pairs[offset:offset + chunk]
+        outcomes = bench.evaluate([_apply(source, pair) for pair in batch])
+        improving = [(list(pair), outcome) for pair, outcome in zip(batch, outcomes) if _better(outcome, failures)]
+        if improving:
+            return min(improving, key=lambda item: _rank(item[1]))
+    return None
+
+
+def _locate(task: TaskSpec, root: Path) -> tuple[str, str] | SolveResult:
+    script_match = _SCRIPT.search(task.instruction)
+    target_match = _TARGET.search(task.instruction)
+    script = script_match["script"] if script_match else None
+    target = target_match["target"] if target_match else None
+    if script is None:
+        tests = sorted(path.name for path in root.glob("test_*.py"))
+        if len(tests) != 1:
+            return SolveResult.unsupported("cannot identify the test script")
+        script = tests[0]
+    if target is None:
+        modules = sorted(
+            path.name for path in root.glob("*.py") if path.name != script and not path.name.startswith("test_")
+        )
+        if len(modules) != 1:
+            return SolveResult.unsupported("cannot identify the module to fix")
+        target = modules[0]
+    for name in (script, target):
+        if not resolve_inside(root, name).is_file():
+            return SolveResult.unsolvable(f"{name!r} named by the task does not exist")
+    if resolve_inside(root, script) == resolve_inside(root, target):
+        return SolveResult.unsupported("the module to fix is the test script")
+    return script, target
+
+
+def _digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    handle, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-")
+    try:
+        with os.fdopen(handle, "wb") as file:
+            file.write(data)
+        shutil.copymode(path, temp_name)
+        os.replace(temp_name, path)
+    finally:
+        Path(temp_name).unlink(missing_ok=True)
+
+
+def solve(task: TaskSpec) -> SolveResult:
+    deadline = time.monotonic() + TIME_LIMIT
+    task = task if task.workspace is not None else replace(task, workspace=task.task_dir)
+    try:
+        located = _locate(task, task.workspace)
+        if isinstance(located, SolveResult):
+            return located
+        script, target = located
+        target_path = resolve_inside(task.workspace, target)
+        script_path = resolve_inside(task.workspace, script)
+        original = target_path.read_bytes()
+        test_source = script_path.read_bytes()
+        script_digest = _digest(script_path)
+    except (OSError, ValueError) as error:
+        return SolveResult.error(f"cannot prepare coding task: {error}")
+
+    bom = codecs.BOM_UTF8 if original.startswith(codecs.BOM_UTF8) else b""
+    body = original[len(bom):]
+    module = ".".join(Path(target).with_suffix("").parts)
+    try:
+        with tempfile.TemporaryDirectory(prefix="jiuwen-coding-") as scratch:
+            bench = _Bench(task, target, script, Path(scratch), deadline)
+            try:
+                found = _search(bench, body, test_source, module)
+            finally:
+                bench.close()
+    except OSError as error:
+        return SolveResult.error(f"cannot evaluate repairs: {error}")
+    if found is None:
+        return SolveResult.unsupported(f"no verified repair within limits after {bench.runs} test runs")
+
+    repaired, applied = found
+    try:
+        if repaired != body:
+            _write_atomic(target_path, bom + repaired)
+        result = run_python_tests(task, script, timeout=max(bench.timeout, 10.0))
+        if not result.passed or _digest(script_path) != script_digest:
+            if repaired != body:
+                _write_atomic(target_path, original)
+            return SolveResult.unsupported("repair did not pass the original tests in place; restored")
+    except (OSError, ValueError) as error:
+        return SolveResult.error(f"cannot apply repair: {error}")
+    detail = "; ".join(applied) if applied else "original tests already pass"
+    return SolveResult.solved("DONE", f"{detail} ({bench.runs} test runs)")
