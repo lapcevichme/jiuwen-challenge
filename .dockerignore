@@ -1,0 +1,6 @@
+*
+!run_agent.py
+!requirements.txt
+!harness/
+**/__pycache__
+**/*.pyc
