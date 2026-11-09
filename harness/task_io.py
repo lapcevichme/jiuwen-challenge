@@ -72,6 +72,7 @@ def write_answer(task: TaskSpec, result: SolveResult) -> None:
         ) as file:
             temp_path = Path(file.name)
             file.write(answer)
+        temp_path.chmod(0o644)
         os.replace(temp_path, task.task_dir / "answer.txt")
     finally:
         if temp_path is not None:
