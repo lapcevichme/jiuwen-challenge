@@ -2,9 +2,13 @@ import ast
 import codecs
 import copy
 import hashlib
+import json
 import os
 import re
 import shutil
+import signal
+import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Iterable, Iterator
@@ -18,9 +22,12 @@ from harness.contracts import SolveResult, TaskSpec
 from harness.runtime import TestResult, run_python_tests
 from harness.task_io import resolve_inside
 
-TIME_LIMIT = 120.0
+TIME_LIMIT = 60.0
 MAX_ROUNDS = 8
-MAX_PAIR_RUNS = 800
+MAX_PAIR_RUNS = 400
+MAX_PROBES = 40
+RIVAL_WINDOW = 1
+LOW_PLAUSIBILITY = 3
 WORKERS = max(1, min(4, os.cpu_count() or 1))
 
 _SCRIPT = re.compile(r"\bRun `(?:python3?\s+)?(?P<script>[\w./-]+\.py)`")
@@ -193,7 +200,7 @@ def _variants(node: ast.AST, parent: ast.AST | None) -> Iterator[tuple[ast.AST |
 
     if isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)) and node is parent.test:
         if not isinstance(node, (ast.Compare, ast.UnaryOp, ast.BoolOp)):
-            yield ast.UnaryOp(ast.Not(), node), 2
+            yield ast.UnaryOp(ast.Not(), node), 3
     if isinstance(node, _DELETABLE) and not isinstance(parent, ast.Module):
         yield b"pass", 3
 
@@ -205,7 +212,7 @@ def _call_variants(node: ast.Call) -> Iterator[tuple[ast.AST, int]]:
             if func.id in family:
                 for other in family:
                     if other != func.id:
-                        yield _with(node, func=ast.Name(other, ast.Load())), 0
+                        yield _with(node, func=ast.Name(other, ast.Load())), 0 if func.id != "all" and func.id != "any" else 1
         if func.id in _UNWRAP and len(node.args) == 1 and not node.keywords:
             yield node.args[0], 3
         if func.id == "range":
@@ -427,9 +434,16 @@ def _search(bench: _Bench, source: bytes, test_source: bytes, module: str) -> tu
         step = None
         for scope in scopes:
             edits = _edits(source, units, sorted(scope))
-            step = _best_single(bench, source, failures, edits) or _best_pair(bench, source, failures, edits)
+            step = _best_single(bench, source, failures, edits)
             if step is not None:
+                chosen, outcome, improving = step
+                _check_unambiguous(bench, source, chosen, improving, test_source, module)
+                step = chosen, outcome
                 break
+            if scope is suspects:
+                step = _best_pair(bench, source, failures, edits)
+                if step is not None:
+                    break
         if step is None:
             return None
         edits, failures = step
@@ -454,8 +468,139 @@ def _best_single(bench: _Bench, source: bytes, failures: Failures, edits: list[_
         if _disjoint(combined):
             outcome = bench.evaluate([_apply(source, combined)])[0]
             if _better(outcome, failures) and _rank(outcome) < _rank(best):
-                return combined, outcome
-    return [best_edit], best
+                return combined, outcome, improving
+    return [best_edit], best, improving
+
+
+class Ambiguous(Exception):
+    pass
+
+
+_PROBE_DRIVER = r"""
+import json, signal, sys, types
+data = json.load(sys.stdin)
+def _alarm(*_):
+    raise TimeoutError
+signal.signal(signal.SIGALRM, _alarm)
+rows = []
+for source in data["sources"]:
+    module = types.ModuleType(data["module"])
+    module.__file__ = data["file"]
+    sys.modules[data["module"]] = module
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 2)
+        exec(compile(source, data["file"], "exec"), module.__dict__)
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        function = getattr(module, data["function"])
+    except BaseException as error:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        rows.append(["LOAD:" + type(error).__name__])
+        continue
+    row = []
+    for args in data["probes"]:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0.5)
+            row.append(repr(function(*eval(args))))
+        except BaseException as error:
+            row.append("EXC:" + type(error).__name__)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+    rows.append(row)
+print(json.dumps(rows))
+"""
+
+
+def _alternatives(value) -> list:
+    if isinstance(value, bool):
+        return [not value]
+    if isinstance(value, int):
+        return [value + 1, value - 1, 0, -value, 3 * value + 7]
+    if isinstance(value, float):
+        return [value + 1.5, -value, 0.0]
+    if isinstance(value, str):
+        words = value.split()
+        return [value.upper(), value.lower(), value.title(), "  " + "   ".join(words) + " ", value[::-1], "",
+                value + " Extra words", " ".join(reversed(words))]
+    if isinstance(value, (list, tuple)):
+        kind = type(value)
+        items = list(value)
+        variants = [items[::-1], sorted(items, key=repr), [], items + items[:1], items[1:], items * 2]
+        if items and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in items):
+            variants += [sorted(items), sorted(items, reverse=True), [-item for item in items],
+                         items + [max(items) + 5], [min(items) - 3] + items]
+        return [kind(variant) for variant in variants]
+    return []
+
+
+def _probes(test_source: bytes, module: str, function: str) -> list[str]:
+    try:
+        tree = ast.parse(test_source)
+    except SyntaxError:
+        return []
+    aliases = {alias.asname or alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
+               for alias in node.names if alias.name == module}
+    direct = {alias.asname or alias.name for node in ast.walk(tree)
+              if isinstance(node, ast.ImportFrom) and node.module == module
+              for alias in node.names if alias.name == function}
+    seeds = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or node.keywords:
+            continue
+        target = node.func
+        if (isinstance(target, ast.Attribute) and target.attr == function and isinstance(target.value, ast.Name)
+                and target.value.id in aliases) or (isinstance(target, ast.Name) and target.id in direct):
+            try:
+                seeds.append(tuple(ast.literal_eval(arg) for arg in node.args))
+            except (ValueError, SyntaxError, TypeError):
+                continue
+    probes: list[str] = []
+    for seed in seeds:
+        for index, value in enumerate(seed):
+            for alternative in _alternatives(value):
+                text = repr(seed[:index] + (alternative,) + seed[index + 1:])
+                if text not in probes:
+                    probes.append(text)
+    return probes[:MAX_PROBES]
+
+
+def _behaviour(bench: "_Bench", sources: list[bytes], function: str, module: str, probes: list[str]):
+    if not hasattr(signal, "setitimer"):
+        return None
+    root = bench.slots.get()
+    try:
+        payload = json.dumps({"sources": [source.decode("utf-8", "replace") for source in sources],
+                              "module": module, "file": str(resolve_inside(root, bench.target)),
+                              "function": function, "probes": probes})
+        completed = subprocess.run(
+            [sys.executable, "-B", "-s", "-c", _PROBE_DRIVER], cwd=root, input=payload, capture_output=True,
+            text=True, timeout=max(5.0, 0.6 * len(probes) * len(sources) + 2), env={"PYTHONIOENCODING": "utf-8"},
+        )
+        return json.loads(completed.stdout) if completed.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        bench.slots.put(root)
+
+
+def _check_unambiguous(bench, source: bytes, chosen: list[_Edit], improving, test_source: bytes, module: str):
+    outcome_of = {edit: outcome for edit, outcome in improving}
+    for edit in chosen:
+        if edit.priority >= LOW_PLAUSIBILITY:
+            raise Ambiguous(f"low-plausibility repair {edit.label}")
+        rivals = [other for other, outcome in improving if other is not edit and other.unit == edit.unit
+                  and outcome == outcome_of[edit] and other.priority <= edit.priority + RIVAL_WINDOW]
+        if not rivals:
+            continue
+        probes = _probes(test_source, module, edit.unit)
+        if not probes:
+            continue
+        candidates = [edit] + sorted(rivals, key=lambda other: other.priority)[:15]
+        rows = _behaviour(bench, [_apply(source, [item]) for item in candidates], edit.unit, module, probes)
+        if rows is None:
+            continue
+        differing = [other.label for other, row in zip(candidates[1:], rows[1:]) if row != rows[0]]
+        if differing:
+            raise Ambiguous(f"{edit.label} vs {differing[0]} (+{len(differing) - 1} more) disagree on probes")
 
 
 def _best_pair(bench: _Bench, source: bytes, failures: Failures, edits: list[_Edit]):
@@ -503,6 +648,38 @@ def _locate(task: TaskSpec, root: Path) -> tuple[str, str] | SolveResult:
     return script, target
 
 
+def _contradiction(test_source: bytes, module_source: bytes, module: str) -> str | None:
+    try:
+        tests, tree = ast.parse(test_source), ast.parse(module_source)
+    except SyntaxError:
+        return None
+    functions = {node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and not any(isinstance(sub, (ast.Global, ast.Nonlocal, ast.Yield, ast.YieldFrom))
+                             for sub in ast.walk(node))}
+    aliases = {alias.asname or alias.name for node in ast.walk(tests) if isinstance(node, ast.Import)
+               for alias in node.names if alias.name == module}
+    seen: dict[str, tuple[str, object]] = {}
+    for node in ast.walk(tests):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "assertEqual" and len(node.args) == 2):
+            continue
+        call, expected = node.args
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name) and call.func.value.id in aliases
+                and call.func.attr in functions and not call.keywords):
+            continue
+        try:
+            arguments = tuple(ast.literal_eval(arg) for arg in call.args)
+            value = ast.literal_eval(expected)
+        except (ValueError, SyntaxError, TypeError):
+            continue
+        key = f"{call.func.attr}{arguments!r}"
+        if key in seen and seen[key][1] != value:
+            return f"{key} is expected to equal both {seen[key][1]!r} and {value!r}"
+        seen.setdefault(key, (call.func.attr, value))
+    return None
+
+
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -516,6 +693,29 @@ def _write_atomic(path: Path, data: bytes) -> None:
         os.replace(temp_name, path)
     finally:
         Path(temp_name).unlink(missing_ok=True)
+
+
+def precheck(task: TaskSpec) -> SolveResult:
+    task = task if task.workspace is not None else replace(task, workspace=task.task_dir)
+    try:
+        located = _locate(task, task.workspace)
+        if isinstance(located, SolveResult):
+            return located
+        script, target = located
+        test_source = resolve_inside(task.workspace, script).read_bytes()
+        module_source = resolve_inside(task.workspace, target).read_bytes()
+    except (OSError, ValueError) as error:
+        return SolveResult.error(f"cannot prepare coding task: {error}")
+    contradiction = _contradiction(test_source, module_source, ".".join(Path(target).with_suffix("").parts))
+    if contradiction:
+        return SolveResult.unsolvable(f"the tests contradict each other: {contradiction}")
+    with tempfile.TemporaryDirectory(prefix="jiuwen-precheck-") as scratch:
+        root = Path(scratch) / "workspace"
+        shutil.copytree(task.workspace, root, symlinks=True)
+        result = run_python_tests(replace(task, workspace=root), script, timeout=30.0)
+    if result.passed:
+        return SolveResult.solved("DONE", "original tests already pass")
+    return SolveResult.unsupported("original tests fail; repair needed")
 
 
 def solve(task: TaskSpec) -> SolveResult:
@@ -534,6 +734,9 @@ def solve(task: TaskSpec) -> SolveResult:
     except (OSError, ValueError) as error:
         return SolveResult.error(f"cannot prepare coding task: {error}")
 
+    contradiction = _contradiction(test_source, original, ".".join(Path(target).with_suffix("").parts))
+    if contradiction:
+        return SolveResult.unsolvable(f"the tests contradict each other: {contradiction}")
     bom = codecs.BOM_UTF8 if original.startswith(codecs.BOM_UTF8) else b""
     body = original[len(bom):]
     module = ".".join(Path(target).with_suffix("").parts)
@@ -542,6 +745,8 @@ def solve(task: TaskSpec) -> SolveResult:
             bench = _Bench(task, target, script, Path(scratch), deadline)
             try:
                 found = _search(bench, body, test_source, module)
+            except Ambiguous as error:
+                return SolveResult.unsupported(f"ambiguous repair: {error}")
             finally:
                 bench.close()
     except OSError as error:
