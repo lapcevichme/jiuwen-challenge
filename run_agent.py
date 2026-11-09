@@ -85,7 +85,8 @@ def build_fallback():
         fast=os.environ.get("LLM_MODEL") or Models.fast,
         strong=os.environ.get("LLM_STRONG_MODEL") or Models.strong,
     )
-    return LLMFallback(LLMClient(base_url, api_key, ledger), models), ledger
+    trust = os.environ.get("LLM_TRUST_FAST_UNSOLVABLE", "1") != "0"
+    return LLMFallback(LLMClient(base_url, api_key, ledger), models, trust_fast_unsolvable=trust), ledger
 
 
 async def _run(root: Path, deadline: float) -> None:

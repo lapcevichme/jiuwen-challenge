@@ -187,9 +187,10 @@ def _failure_summary(output: str, limit: int = 1500) -> str:
 
 
 class LLMFallback:
-    def __init__(self, client: LLMClient, models: Models = Models()):
+    def __init__(self, client: LLMClient, models: Models = Models(), *, trust_fast_unsolvable: bool = True):
         self.client = client
         self.models = models
+        self.trust_fast_unsolvable = trust_fast_unsolvable
         self._event: dict = {}
 
     async def __call__(self, task: TaskSpec, previous: SolveResult, *, attempt: int, timeout: float) -> SolveResult:
@@ -230,7 +231,7 @@ class LLMFallback:
         reply = await self._chat(model, SCRIPT_SYSTEM, prompt, max_tokens, max(1.0, timeout - SCRIPT_TIMEOUT),
                                  task.task_id)
         if reply.content.strip().strip("`").strip().upper().rstrip(".") == "UNSOLVABLE":
-            if final:
+            if final or (self.trust_fast_unsolvable and task.task_type != "search"):
                 return SolveResult.unsolvable(f"{model} finds information missing for an exact answer")
             return SolveResult.unsupported(f"{model} replied UNSOLVABLE")
         code = extract_code(reply.content)
