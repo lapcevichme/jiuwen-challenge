@@ -22,6 +22,11 @@ _FIELD = re.compile(r"([\w][\w -]*):\s*(\S.*)")
 _ATTRIBUTES = {"born", "mentor", "employer", "headquarters", "founded"}
 
 
+def _plain_name(text: str) -> bool:
+    words = text.split()
+    return bool(words) and all(word[0].isupper() for word in words) and not re.search(r"['’]s\b", text)
+
+
 def _normalize(text: str) -> str:
     return " ".join(text.casefold().split())
 
@@ -83,10 +88,13 @@ def solve(task: TaskSpec) -> SolveResult:
     except ValueError as error:
         return SolveResult.unsupported(str(error))
 
+    known = {name for name, _ in index}
     evidence = []
-    for attribute in attributes:
+    for hop, attribute in enumerate(attributes):
         values = index.get((_normalize(entity), attribute), {})
         if not values:
+            if hop == 0 and _normalize(entity) not in known and not _plain_name(entity):
+                return SolveResult.unsupported(f"question subject {entity!r} is a description, not a name")
             return SolveResult.unsolvable(
                 f"fully read {directory!r}; no {attribute} fact for {entity!r}",
             )
