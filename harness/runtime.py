@@ -12,6 +12,7 @@ from harness.contracts import TaskSpec
 from harness.task_io import resolve_inside
 
 _OUTPUT_LIMIT = 64 * 1024
+_CHILD = Path(__file__).with_name("_child.py").resolve()
 
 
 @dataclass(frozen=True)
@@ -51,25 +52,29 @@ def run_python_tests(task: TaskSpec, script: str | Path, *, timeout: float) -> T
     test_path = resolve_inside(task.workspace, script)
     if not test_path.is_file() or test_path.suffix != ".py":
         raise ValueError("expected an existing Python test script inside workspace")
-    return run_python(test_path, cwd=task.workspace, timeout=timeout)
+    return run_python(test_path, cwd=task.workspace, timeout=timeout, writable=False)
 
 
-def run_python(script: Path, *, cwd: Path, timeout: float) -> TestResult:
+def run_python(
+    script: Path, *, cwd: Path, timeout: float, writable: bool = True, input_data: str = "",
+) -> TestResult:
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be finite and positive")
-    test_path = script
-
     env = {"PYTHONIOENCODING": "utf-8"}
     if os.name == "nt" and "SystemRoot" in os.environ:
         env["SystemRoot"] = os.environ["SystemRoot"]
     with tempfile.TemporaryDirectory(prefix="jiuwen-test-") as scratch:
         env.update(TMP=scratch, TEMP=scratch, TMPDIR=scratch)
-        process = subprocess.Popen(
-            [sys.executable, "-B", "-s", str(test_path)],
-            cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            start_new_session=os.name == "posix",
-        )
+        command = [sys.executable, "-I", "-S", "-B", "-X", "utf8", str(_CHILD),
+                   str(script.resolve()), scratch, str(int(writable))]
+        with tempfile.TemporaryFile() as stdin:
+            stdin.write(input_data.encode("utf-8"))
+            stdin.seek(0)
+            process = subprocess.Popen(
+                command, cwd=cwd, env=env, stdin=stdin if input_data else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                start_new_session=os.name == "posix",
+            )
         output = bytearray()
 
         def drain_output() -> None:

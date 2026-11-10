@@ -6,9 +6,6 @@ import json
 import os
 import re
 import shutil
-import signal
-import subprocess
-import sys
 import tempfile
 import time
 from collections.abc import Iterable, Iterator
@@ -19,7 +16,7 @@ from pathlib import Path
 from queue import SimpleQueue
 
 from harness.contracts import SolveResult, TaskSpec
-from harness.runtime import TestResult, run_python_tests
+from harness.runtime import TestResult, run_python, run_python_tests
 from harness.task_io import resolve_inside
 
 TIME_LIMIT = 60.0
@@ -481,30 +478,36 @@ import json, signal, sys, types
 data = json.load(sys.stdin)
 def _alarm(*_):
     raise TimeoutError
-signal.signal(signal.SIGALRM, _alarm)
+if hasattr(signal, "setitimer"):
+    signal.signal(signal.SIGALRM, _alarm)
+    def timer(seconds):
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+else:
+    def timer(seconds):
+        pass
 rows = []
 for source in data["sources"]:
     module = types.ModuleType(data["module"])
     module.__file__ = data["file"]
     sys.modules[data["module"]] = module
     try:
-        signal.setitimer(signal.ITIMER_REAL, 2)
+        timer(2)
         exec(compile(source, data["file"], "exec"), module.__dict__)
-        signal.setitimer(signal.ITIMER_REAL, 0)
+        timer(0)
         function = getattr(module, data["function"])
     except BaseException as error:
-        signal.setitimer(signal.ITIMER_REAL, 0)
+        timer(0)
         rows.append(["LOAD:" + type(error).__name__])
         continue
     row = []
     for args in data["probes"]:
         try:
-            signal.setitimer(signal.ITIMER_REAL, 0.5)
+            timer(0.5)
             row.append(repr(function(*eval(args))))
         except BaseException as error:
             row.append("EXC:" + type(error).__name__)
         finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
+            timer(0)
     rows.append(row)
 print(json.dumps(rows))
 """
@@ -564,19 +567,20 @@ def _probes(test_source: bytes, module: str, function: str) -> list[str]:
 
 
 def _behaviour(bench: "_Bench", sources: list[bytes], function: str, module: str, probes: list[str]):
-    if not hasattr(signal, "setitimer"):
+    timeout = min(bench.deadline - time.monotonic(), max(5.0, 0.6 * len(probes) * len(sources) + 2))
+    if timeout <= 0:
         return None
     root = bench.slots.get()
     try:
         payload = json.dumps({"sources": [source.decode("utf-8", "replace") for source in sources],
                               "module": module, "file": str(resolve_inside(root, bench.target)),
                               "function": function, "probes": probes})
-        completed = subprocess.run(
-            [sys.executable, "-B", "-s", "-c", _PROBE_DRIVER], cwd=root, input=payload, capture_output=True,
-            text=True, timeout=max(5.0, 0.6 * len(probes) * len(sources) + 2), env={"PYTHONIOENCODING": "utf-8"},
-        )
-        return json.loads(completed.stdout) if completed.returncode == 0 else None
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+        with tempfile.TemporaryDirectory(prefix="jiuwen-probe-") as scratch:
+            driver = Path(scratch) / "probe.py"
+            driver.write_text(_PROBE_DRIVER, encoding="utf-8")
+            completed = run_python(driver, cwd=root, timeout=timeout, writable=False, input_data=payload)
+        return json.loads(completed.output) if completed.passed else None
+    except (OSError, ValueError):
         return None
     finally:
         bench.slots.put(root)
@@ -596,8 +600,8 @@ def _check_unambiguous(bench, source: bytes, chosen: list[_Edit], improving, tes
             continue
         candidates = [edit] + sorted(rivals, key=lambda other: other.priority)[:15]
         rows = _behaviour(bench, [_apply(source, [item]) for item in candidates], edit.unit, module, probes)
-        if rows is None:
-            continue
+        if not isinstance(rows, list) or len(rows) != len(candidates):
+            raise Ambiguous(f"could not compare {edit.label} against alternative repairs")
         differing = [other.label for other, row in zip(candidates[1:], rows[1:]) if row != rows[0]]
         if differing:
             raise Ambiguous(f"{edit.label} vs {differing[0]} (+{len(differing) - 1} more) disagree on probes")

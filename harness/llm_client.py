@@ -7,7 +7,7 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from harness.budget import BudgetExhausted, BudgetLedger
+from harness.budget import BudgetLedger
 
 LOG = logging.getLogger("harness")
 
@@ -83,10 +83,7 @@ class LLMClient:
         if self._failures >= self.max_consecutive_failures:
             raise LLMUnavailable(f"{self._failures} consecutive proxy failures")
         prompt_estimate = sum(estimate_tokens(message["content"]) + 8 for message in messages) + 16
-        try:
-            reservation = self.ledger.reserve(prompt_estimate, max_tokens)
-        except BudgetExhausted as error:
-            raise LLMUnavailable(f"budget exhausted: {error}") from error
+        reservation = self.ledger.reserve(prompt_estimate, max_tokens)
 
         body = json.dumps({
             "model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0,

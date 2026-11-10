@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from harness.budget import BudgetExhausted
 from harness.contracts import SolveResult, TaskSpec
 from harness.llm_client import LLMClient, LLMError, LLMUnavailable
 from harness.runtime import run_python, run_python_tests
@@ -86,7 +87,8 @@ def extract_code(content: str) -> str:
 def workspace_context(workspace: Path | None) -> str:
     if workspace is None:
         return ""
-    files = sorted(path for path in workspace.rglob("*") if path.is_file())
+    files = sorted(path for path in workspace.rglob("*") if not path.is_symlink() and path.is_file()
+                   and path.resolve().is_relative_to(workspace))
     names = [str(path.relative_to(workspace)) for path in files]
     parts = [f"Files ({len(names)}): " + ", ".join(names[:60]) + (", ..." if len(names) > 60 else "")]
     kinds: set[str] = set()
@@ -103,7 +105,8 @@ def workspace_context(workspace: Path | None) -> str:
                 kind = path.parent.as_posix() + "/" + path.stem.split("_")[0] + suffix
                 if kind not in kinds and len(kinds) < 3:
                     kinds.add(kind)
-                    parts.append(f"Example {name}:\n" + path.read_text(encoding="utf-8", errors="replace")[:400])
+                    with path.open(encoding="utf-8", errors="replace") as file:
+                        parts.append(f"Example {name}:\n" + file.read(400))
         except OSError:
             continue
     return "\n\n".join(parts)[:CONTEXT_CHARS]
@@ -203,7 +206,8 @@ class LLMFallback:
     def estimate(self, task: TaskSpec, attempt: int) -> float:
         if task.task_type == "coding":
             directory = task.workspace or task.task_dir
-            chars = sum(path.stat().st_size for path in directory.rglob("*.py") if path.is_file())
+            chars = sum(path.stat().st_size for path in directory.rglob("*.py")
+                        if not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(directory))
         else:
             chars = len(task.instruction) + len(workspace_context(task.workspace))
         output = EXPECTED_OUTPUT[min(attempt, 2)].get(task.task_type, 300)
@@ -220,6 +224,9 @@ class LLMFallback:
                 result = await self._coding(task, model, max_tokens, timeout, feedback)
             else:
                 result = await self._script(task, model, max_tokens, timeout, feedback, final=strong)
+        except BudgetExhausted as error:
+            trace({**self._event, "status": "BUDGET_SKIPPED", "detail": str(error)})
+            raise
         except LLMUnavailable as error:
             trace({**self._event, "status": "UNAVAILABLE", "detail": str(error)[:300]})
             raise FallbackUnavailable(str(error)) from error

@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
+from harness.budget import BudgetExhausted
 from harness.contracts import SolveResult, SolveStatus, TaskSpec
 from harness.task_io import write_answer
 
@@ -117,6 +118,9 @@ async def _fallback_pass(
                     result = await fallback(task, previous, attempt=attempt, timeout=timeout)
                 if not isinstance(result, SolveResult):
                     raise TypeError("fallback solver must return SolveResult")
+            except BudgetExhausted as error:
+                LOG.info("%r fallback #%d skipped by budget: %s", task.task_id, attempt, error)
+                continue
             except FallbackUnavailable as error:
                 LOG.warning("fallback stopped: %r", str(error)[:512])
                 return unresolved()
