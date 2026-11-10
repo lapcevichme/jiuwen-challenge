@@ -57,6 +57,13 @@ CODING_SYSTEM = (
 )
 
 
+EXPECTED_OUTPUT = {
+    1: {"math": 50, "data_analysis": 85, "coding": 145, "search": 235},
+    2: {"math": 500, "data_analysis": 180, "coding": 500, "search": 330},
+}
+CHARS_PER_INPUT_TOKEN = 3.0
+
+
 @dataclass(frozen=True)
 class Models:
     fast: str = "qwen3.8-27b-noreason"
@@ -192,6 +199,15 @@ class LLMFallback:
         self.models = models
         self.trust_fast_unsolvable = trust_fast_unsolvable
         self._event: dict = {}
+
+    def estimate(self, task: TaskSpec, attempt: int) -> float:
+        if task.task_type == "coding":
+            directory = task.workspace or task.task_dir
+            chars = sum(path.stat().st_size for path in directory.rglob("*.py") if path.is_file())
+        else:
+            chars = len(task.instruction) + len(workspace_context(task.workspace))
+        output = EXPECTED_OUTPUT[min(attempt, 2)].get(task.task_type, 300)
+        return (len(SCRIPT_SYSTEM) + chars) / CHARS_PER_INPUT_TOKEN / 10 + output
 
     async def __call__(self, task: TaskSpec, previous: SolveResult, *, attempt: int, timeout: float) -> SolveResult:
         strong = attempt >= 2

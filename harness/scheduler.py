@@ -17,6 +17,7 @@ class FallbackUnavailable(RuntimeError):
 
 
 class FallbackSolver(Protocol):
+
     async def __call__(
         self, task: TaskSpec, previous: SolveResult, *, attempt: int, timeout: float,
     ) -> SolveResult: ...
@@ -81,18 +82,36 @@ async def run_tasks(
         await _last_resort_pass(unresolved, last_resort, deadline=deadline, limits=limits)
 
 
+def _priority(fallback: FallbackSolver, task: TaskSpec, attempt: int) -> float:
+    estimate = getattr(fallback, "estimate", None)
+    if estimate is None:
+        return task.reward
+    try:
+        cost = float(estimate(task, attempt))
+    except Exception as error:
+        LOG.warning("%r cost estimate failed: %s: %s", task.task_id, type(error).__name__, error)
+        return task.reward
+    return task.reward / cost if math.isfinite(cost) and cost >= 1 else task.reward
+
+
 async def _fallback_pass(
     pending: list[tuple[TaskSpec, SolveResult]], fallback: FallbackSolver, *, deadline: float, limits: ScheduleLimits,
 ) -> list[TaskSpec]:
     cutoff = deadline - limits.fallback_reserve
-    unresolved: list[TaskSpec] = []
-    for index, (task, previous) in enumerate(pending):
-        final = False
-        for attempt in range(1, limits.max_fallback_attempts + 1):
+    final: set[int] = set()
+
+    def unresolved() -> list[TaskSpec]:
+        return [task for task, _ in pending if id(task) not in final]
+
+    active = list(pending)
+    for attempt in range(1, limits.max_fallback_attempts + 1):
+        active.sort(key=lambda entry: -_priority(fallback, entry[0], attempt))
+        retry: list[tuple[TaskSpec, SolveResult]] = []
+        for task, previous in active:
             timeout = min(limits.fallback_timeout, cutoff - time.monotonic())
             if timeout <= 0:
                 LOG.warning("fallback deadline reached")
-                return unresolved + [task for task, _ in pending[index:]]
+                return unresolved()
             try:
                 async with asyncio.timeout(timeout):
                     result = await fallback(task, previous, attempt=attempt, timeout=timeout)
@@ -100,21 +119,21 @@ async def _fallback_pass(
                     raise TypeError("fallback solver must return SolveResult")
             except FallbackUnavailable as error:
                 LOG.warning("fallback stopped: %r", str(error)[:512])
-                return unresolved + [task for task, _ in pending[index:]]
+                return unresolved()
             except TimeoutError:
-                previous = SolveResult.error("fallback attempt timed out")
-                _record(task, previous, f"fallback #{attempt}")
+                result = SolveResult.error("fallback attempt timed out")
+                _record(task, result, f"fallback #{attempt}")
+                retry.append((task, result))
                 continue
             except Exception as error:
                 result = SolveResult.error(f"{type(error).__name__}: {error}")
             _record(task, result, f"fallback #{attempt}")
-            if result.status is not SolveStatus.UNSUPPORTED:
-                final = result.status in (SolveStatus.SOLVED, SolveStatus.UNSOLVABLE)
-                break
-            previous = result
-        if not final:
-            unresolved.append(task)
-    return unresolved
+            if result.status is SolveStatus.UNSUPPORTED:
+                retry.append((task, result))
+            elif result.status in (SolveStatus.SOLVED, SolveStatus.UNSOLVABLE):
+                final.add(id(task))
+        active = retry
+    return unresolved()
 
 
 async def _last_resort_pass(
