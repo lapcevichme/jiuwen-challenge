@@ -60,6 +60,9 @@ SCRIPT_SYSTEM = (
     "files are in the current directory; handle every sentence in order and apply rounding exactly as stated; "
     "print only the final answer. Output only code."
 )
+MATH_SYSTEM = SCRIPT_SYSTEM + (
+    " For inverse problems, verify the candidate by substituting it back into the original conditions."
+)
 CODING_SYSTEM = (
     "Fix the module according to the task and its documented contract. Visible tests are examples, not the "
     "complete specification. Preserve the API, required return types and behavior on edge cases; do not "
@@ -141,6 +144,8 @@ _LOOKUP_FAILURE = re.compile(
     r"no (?:matching )?(?:person|records?|entities|values?|answers?|files?|data|matches|results?)(?: found)?[.!]?",
     re.IGNORECASE,
 )
+_SEARCH_LITERAL = re.compile(r"[^\W_][\w .’'&/-]{0,119}")
+_TABLE_SEPARATOR = re.compile(r"\s*\|(?:\s*:?-{3,}:?\s*\|)+\s*")
 
 
 def normalize_answer(output: str, check: str | None) -> str | None:
@@ -154,6 +159,29 @@ def normalize_answer(output: str, check: str | None) -> str | None:
         match = re.fullmatch(r"([+-]?(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+))(?:\.0+)?", answer)
         return str(int(match[1].replace(",", ""))) if match else None
     return answer
+
+
+def _grounded_search_answer(reply: str, context: str) -> str | None:
+    text = reply.strip()
+    if not _SEARCH_LITERAL.fullmatch(text) or normalize_answer(text, "exact_str") is None:
+        return None
+    lines = context.splitlines()
+    for index, line in enumerate(lines[1:], 1):
+        if line.startswith(("--- ", "Example ")):
+            continue
+        line = line.strip()
+        if line.startswith("|"):
+            if index + 1 < len(lines) and _TABLE_SEPARATOR.fullmatch(lines[index + 1]):
+                continue
+            values = line.split("|")[1:]
+        else:
+            _, separator, value = line.partition(":")
+            values = [value] if separator else []
+        for value in values:
+            literal = value.strip(" *`")
+            if literal.casefold() == text.casefold():
+                return literal
+    return None
 
 
 def _scratch_copy(task: TaskSpec, scratch: Path) -> Path:
@@ -362,8 +390,8 @@ class LLMFallback:
         if context:
             prompt += "\n\n" + context
         prompt += self._feedback(task, feedback)
-        reply = await self._chat(model, SCRIPT_SYSTEM, prompt, max_tokens, max(1.0, timeout - SCRIPT_TIMEOUT),
-                                 task.task_id)
+        system = MATH_SYSTEM if task.task_type == "math" else SCRIPT_SYSTEM
+        reply = await self._chat(model, system, prompt, max_tokens, max(1.0, timeout - SCRIPT_TIMEOUT), task.task_id)
         self._previous_code[task.task_dir] = extract_code(reply.content)[:6000]
         if reply.finish_reason == "length":
             return SolveResult.unsupported(f"{model} output truncated before completion")
@@ -371,6 +399,10 @@ class LLMFallback:
             if final or (self.trust_fast_unsolvable and task.task_type == "math" and task.workspace is None):
                 return SolveResult.unsolvable(f"{model} finds information missing for an exact answer")
             return SolveResult.unsupported(f"{model} replied UNSOLVABLE")
+        if task.task_type == "search" and task.check == "exact_str":
+            answer = _grounded_search_answer(reply.content, context)
+            if answer is not None:
+                return SolveResult.solved(answer, f"{model} returned a value shown in the search context")
         code = extract_code(reply.content)
         if not code:
             return SolveResult.unsupported(f"{model} returned no code")
