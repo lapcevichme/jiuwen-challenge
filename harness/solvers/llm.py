@@ -126,12 +126,15 @@ def workspace_context(workspace: Path | None) -> str:
     return "\n\n".join(parts)[:CONTEXT_CHARS + (FULL_CONTEXT_CHARS if full else 0)]
 
 
+_NO_VALUE = {"none", "null", "nan", "undefined", "n/a", "[]", "{}", "''", '""'}
+
+
 def normalize_answer(output: str, check: str | None) -> str | None:
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     if not lines:
         return None
     answer = lines[-1]
-    if len(answer) > 200:
+    if len(answer) > 200 or answer.casefold() in _NO_VALUE:
         return None
     if check == "exact_int":
         match = re.fullmatch(r"(-?[0-9]+)(?:\.0+)?", answer.replace(",", ""))
