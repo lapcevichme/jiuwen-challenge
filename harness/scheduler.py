@@ -17,6 +17,10 @@ class FallbackUnavailable(RuntimeError):
     pass
 
 
+class FallbackRetryLater(RuntimeError):
+    pass
+
+
 class FallbackSolver(Protocol):
 
     async def __call__(
@@ -30,6 +34,8 @@ class ScheduleLimits:
     fallback_timeout: float = 45.0
     fallback_reserve: float = 60.0
     last_resort_reserve: float = 75.0
+    fallback_concurrency: int = 1
+    max_requeues: int = 2
 
     def __post_init__(self) -> None:
         if type(self.max_fallback_attempts) is not int or self.max_fallback_attempts < 0:
@@ -40,6 +46,8 @@ class ScheduleLimits:
             raise ValueError("fallback_reserve must be finite and non-negative")
         if not math.isfinite(self.last_resort_reserve) or self.last_resort_reserve < 0:
             raise ValueError("last_resort_reserve must be finite and non-negative")
+        if type(self.fallback_concurrency) is not int or not 1 <= self.fallback_concurrency <= 5:
+            raise ValueError("fallback_concurrency must be an integer from 1 to 5")
 
 
 def _record(task: TaskSpec, result: SolveResult, phase: str) -> None:
@@ -100,44 +108,73 @@ async def _fallback_pass(
 ) -> list[TaskSpec]:
     cutoff = deadline - limits.fallback_reserve
     final: set[int] = set()
+    stopped = False
 
-    def unresolved() -> list[TaskSpec]:
-        return [task for task, _ in pending if id(task) not in final]
+    async def attempt_one(task: TaskSpec, previous: SolveResult, attempt: int,
+                          retry: list[tuple[TaskSpec, SolveResult]], requeue) -> None:
+        nonlocal stopped
+        timeout = min(limits.fallback_timeout, cutoff - time.monotonic())
+        if timeout <= 0:
+            LOG.warning("fallback deadline reached")
+            stopped = True
+            return
+        try:
+            async with asyncio.timeout(timeout):
+                result = await fallback(task, previous, attempt=attempt, timeout=timeout)
+            if not isinstance(result, SolveResult):
+                raise TypeError("fallback solver must return SolveResult")
+        except BudgetExhausted as error:
+            LOG.info("%r fallback #%d skipped by budget: %s", task.task_id, attempt, error)
+            return
+        except FallbackUnavailable as error:
+            if not stopped:
+                LOG.warning("fallback stopped: %r", str(error)[:512])
+            stopped = True
+            return
+        except (FallbackRetryLater, TimeoutError) as error:
+            detail = str(error) if isinstance(error, FallbackRetryLater) else "fallback attempt timed out"
+            if requeue(task, previous):
+                LOG.info("%r requeued after fallback #%d: %s", task.task_id, attempt, detail[:200])
+                return
+            result = SolveResult.error(detail)
+            _record(task, result, f"fallback #{attempt}")
+            retry.append((task, result))
+            return
+        except Exception as error:
+            result = SolveResult.error(f"{type(error).__name__}: {error}")
+        _record(task, result, f"fallback #{attempt}")
+        if result.status is SolveStatus.UNSUPPORTED:
+            retry.append((task, result))
+        elif result.status in (SolveStatus.SOLVED, SolveStatus.UNSOLVABLE):
+            final.add(id(task))
 
     active = list(pending)
     for attempt in range(1, limits.max_fallback_attempts + 1):
         active.sort(key=lambda entry: -_priority(fallback, entry[0], attempt))
         retry: list[tuple[TaskSpec, SolveResult]] = []
-        for task, previous in active:
-            timeout = min(limits.fallback_timeout, cutoff - time.monotonic())
-            if timeout <= 0:
-                LOG.warning("fallback deadline reached")
-                return unresolved()
-            try:
-                async with asyncio.timeout(timeout):
-                    result = await fallback(task, previous, attempt=attempt, timeout=timeout)
-                if not isinstance(result, SolveResult):
-                    raise TypeError("fallback solver must return SolveResult")
-            except BudgetExhausted as error:
-                LOG.info("%r fallback #%d skipped by budget: %s", task.task_id, attempt, error)
-                continue
-            except FallbackUnavailable as error:
-                LOG.warning("fallback stopped: %r", str(error)[:512])
-                return unresolved()
-            except TimeoutError:
-                result = SolveResult.error("fallback attempt timed out")
-                _record(task, result, f"fallback #{attempt}")
-                retry.append((task, result))
-                continue
-            except Exception as error:
-                result = SolveResult.error(f"{type(error).__name__}: {error}")
-            _record(task, result, f"fallback #{attempt}")
-            if result.status is SolveStatus.UNSUPPORTED:
-                retry.append((task, result))
-            elif result.status in (SolveStatus.SOLVED, SolveStatus.UNSOLVABLE):
-                final.add(id(task))
+        order = list(active)
+        position = 0
+        requeued: dict[int, int] = {}
+
+        def requeue(task: TaskSpec, previous: SolveResult) -> bool:
+            if requeued.get(id(task), 0) >= limits.max_requeues:
+                return False
+            requeued[id(task)] = requeued.get(id(task), 0) + 1
+            order.append((task, previous))
+            return True
+
+        async def worker() -> None:
+            nonlocal position
+            while not stopped and position < len(order):
+                task, previous = order[position]
+                position += 1
+                await attempt_one(task, previous, attempt, retry, requeue)
+
+        await asyncio.gather(*(worker() for _ in range(limits.fallback_concurrency)))
+        if stopped:
+            break
         active = retry
-    return unresolved()
+    return [task for task, _ in pending if id(task) not in final]
 
 
 async def _last_resort_pass(

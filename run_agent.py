@@ -14,6 +14,7 @@ from harness.task_io import load_task, resolve_inside
 
 LOG = logging.getLogger("harness")
 DEFAULT_BUDGET = 100_000
+DEFAULT_CONCURRENCY = 3
 
 
 def build_registry() -> dict[str, Solver]:
@@ -89,16 +90,29 @@ def build_fallback():
     return LLMFallback(LLMClient(base_url, api_key, ledger), models, trust_fast_unsolvable=trust), ledger
 
 
+def build_limits() -> "ScheduleLimits":
+    from harness.scheduler import ScheduleLimits
+
+    try:
+        return ScheduleLimits(fallback_concurrency=int(os.environ.get("LLM_CONCURRENCY") or DEFAULT_CONCURRENCY))
+    except ValueError:
+        LOG.warning("invalid LLM_CONCURRENCY %r; using %d", os.environ.get("LLM_CONCURRENCY"), DEFAULT_CONCURRENCY)
+        return ScheduleLimits(fallback_concurrency=DEFAULT_CONCURRENCY)
+
+
 async def _run(root: Path, deadline: float) -> None:
     from harness.workflow import SolverWorkflow
 
+    from harness.runtime import sandbox_status
+
+    LOG.info("task sandbox: %s", sandbox_status())
     workflow = SolverWorkflow(build_registry())
     rescue = build_last_resort()
     last_resort = SolverWorkflow(rescue).solve if rescue else None
     fallback, ledger = build_fallback()
     try:
         await run_tasks(_tasks(root), workflow.solve, deadline=deadline, fallback=fallback,
-                        last_resort=last_resort)
+                        last_resort=last_resort, limits=build_limits())
     finally:
         if ledger is not None:
             LOG.info("%s", ledger.summary())

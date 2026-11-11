@@ -1,4 +1,6 @@
 import ast
+import asyncio
+import contextvars
 import json
 import os
 import re
@@ -13,7 +15,7 @@ from harness.budget import BudgetExhausted
 from harness.contracts import SolveResult, TaskSpec
 from harness.llm_client import LLMClient, LLMError, LLMUnavailable
 from harness.runtime import run_python, run_python_tests
-from harness.scheduler import FallbackUnavailable
+from harness.scheduler import FallbackRetryLater, FallbackUnavailable
 from harness.solvers.coding import _digest, _locate, _write_atomic
 from harness.task_io import resolve_inside
 
@@ -36,7 +38,11 @@ def trace(event: dict) -> None:
 
 SCRIPT_NAME = "llm_solution.py"
 SCRIPT_TIMEOUT = 10.0
+_EVENT: contextvars.ContextVar[dict] = contextvars.ContextVar("llm_event")
 CONTEXT_CHARS = 4000
+FULL_CONTEXT_CHARS = int(os.environ.get("LLM_FULL_CONTEXT_CHARS") or 6000)
+TEXT_SUFFIXES = (".csv", ".tsv", ".md", ".txt", ".json", ".yaml", ".yml")
+CSV = (".csv", ".tsv")
 
 _BOILERPLATE = re.compile(
     r"\s*(?:Compute it with the bash tool[^.]*\.|Use bash with python3 to compute it\.|"
@@ -91,17 +97,25 @@ def workspace_context(workspace: Path | None) -> str:
                    and path.resolve().is_relative_to(workspace))
     names = [str(path.relative_to(workspace)) for path in files]
     parts = [f"Files ({len(names)}): " + ", ".join(names[:60]) + (", ..." if len(names) > 60 else "")]
+    try:
+        prose = [path for path in files if path.suffix.lower() in TEXT_SUFFIXES and path.suffix.lower() not in CSV]
+        full = (len(files) <= 60 and all(path.suffix.lower() in TEXT_SUFFIXES for path in files)
+                and sum(path.stat().st_size for path in prose) <= FULL_CONTEXT_CHARS)
+    except OSError:
+        full = False
     kinds: set[str] = set()
     for path, name in zip(files, names):
         suffix = path.suffix.lower()
         try:
-            if suffix in (".csv", ".tsv"):
+            if suffix in CSV:
                 with path.open(encoding="utf-8-sig", errors="replace") as file:
                     head = [next(file, "").rstrip("\n") for _ in range(3)]
                 with path.open(encoding="utf-8", errors="replace") as file:
                     rows = sum(1 for _ in file) - 1
                 parts.append(f"{name} ({rows} data rows), first lines:\n" + "\n".join(head))
-            elif suffix in (".md", ".txt", ".json", ".yaml", ".yml"):
+            elif suffix in TEXT_SUFFIXES and full:
+                parts.append(f"--- {name}\n" + path.read_text(encoding="utf-8-sig", errors="replace").strip())
+            elif suffix in TEXT_SUFFIXES:
                 kind = path.parent.as_posix() + "/" + path.stem.split("_")[0] + suffix
                 if kind not in kinds and len(kinds) < 3:
                     kinds.add(kind)
@@ -109,7 +123,7 @@ def workspace_context(workspace: Path | None) -> str:
                         parts.append(f"Example {name}:\n" + file.read(400))
         except OSError:
             continue
-    return "\n\n".join(parts)[:CONTEXT_CHARS]
+    return "\n\n".join(parts)[:CONTEXT_CHARS + (FULL_CONTEXT_CHARS if full else 0)]
 
 
 def normalize_answer(output: str, check: str | None) -> str | None:
@@ -201,7 +215,6 @@ class LLMFallback:
         self.client = client
         self.models = models
         self.trust_fast_unsolvable = trust_fast_unsolvable
-        self._event: dict = {}
 
     def estimate(self, task: TaskSpec, attempt: int) -> float:
         if task.task_type == "coding":
@@ -218,21 +231,24 @@ class LLMFallback:
         model = self.models.strong if strong else self.models.fast
         max_tokens = self.models.strong_max_tokens if strong else self.models.fast_max_tokens
         feedback = previous.detail[:400] if attempt >= 2 else ""
-        self._event = {"task": task.task_id, "type": task.task_type, "attempt": attempt, "model": model}
+        _EVENT.set({"task": task.task_id, "type": task.task_type, "attempt": attempt, "model": model})
         try:
             if task.task_type == "coding":
                 result = await self._coding(task, model, max_tokens, timeout, feedback)
             else:
                 result = await self._script(task, model, max_tokens, timeout, feedback, final=strong)
         except BudgetExhausted as error:
-            trace({**self._event, "status": "BUDGET_SKIPPED", "detail": str(error)})
+            trace({**_EVENT.get(), "status": "BUDGET_SKIPPED", "detail": str(error)})
             raise
         except LLMUnavailable as error:
-            trace({**self._event, "status": "UNAVAILABLE", "detail": str(error)[:300]})
+            trace({**_EVENT.get(), "status": "UNAVAILABLE", "detail": str(error)[:300]})
             raise FallbackUnavailable(str(error)) from error
         except LLMError as error:
+            if error.transient:
+                trace({**_EVENT.get(), "status": "RETRY_LATER", "detail": str(error)[:300]})
+                raise FallbackRetryLater(str(error)) from error
             result = SolveResult.unsupported(f"LLM request failed: {error}")
-        trace({**self._event, "status": result.status.value, "answer": result.answer, "detail": result.detail[:500]})
+        trace({**_EVENT.get(), "status": result.status.value, "answer": result.answer, "detail": result.detail[:500]})
         return result
 
     async def _chat(self, model: str, system: str, prompt: str, max_tokens: int, timeout: float, label: str):
@@ -240,7 +256,7 @@ class LLMFallback:
             model, [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
             max_tokens=max_tokens, timeout=timeout, label=label,
         )
-        self._event.update(prompt=prompt, reply=reply.content, cost=reply.cost, input_tokens=reply.prompt_tokens,
+        _EVENT.get().update(prompt=prompt, reply=reply.content, cost=reply.cost, input_tokens=reply.prompt_tokens,
                            output_tokens=reply.completion_tokens, seconds=round(reply.seconds, 2))
         return reply
 
@@ -264,8 +280,8 @@ class LLMFallback:
             root = _scratch_copy(task, Path(scratch))
             script = Path(scratch) / SCRIPT_NAME
             script.write_text(code, encoding="utf-8")
-            result = run_python(script, cwd=root, timeout=SCRIPT_TIMEOUT)
-        self._event["script_output"] = result.output[-500:]
+            result = await asyncio.to_thread(run_python, script, cwd=root, timeout=SCRIPT_TIMEOUT)
+        _EVENT.get()["script_output"] = result.output[-500:]
         if not result.passed:
             reason = "timed out" if result.timed_out else _failure_summary(result.output, 300) or "failed"
             return SolveResult.unsupported(f"{model} script {reason}")
@@ -290,7 +306,8 @@ class LLMFallback:
         tests = script_path.read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory(prefix="jiuwen-llm-") as scratch:
             root = _scratch_copy(task, Path(scratch))
-            baseline = run_python_tests(replace(task, workspace=root), script, timeout=SCRIPT_TIMEOUT)
+            baseline = await asyncio.to_thread(run_python_tests, replace(task, workspace=root), script,
+                                              timeout=SCRIPT_TIMEOUT)
             if baseline.passed:
                 return SolveResult.solved("DONE", "original tests already pass")
             prompt = (
@@ -308,13 +325,14 @@ class LLMFallback:
             if gaming:
                 return SolveResult.unsupported(f"{model} {gaming}; rejected as test gaming")
             resolve_inside(root, target).write_text(patched, encoding="utf-8")
-            check = run_python_tests(replace(task, workspace=root), script, timeout=SCRIPT_TIMEOUT)
+            check = await asyncio.to_thread(run_python_tests, replace(task, workspace=root), script,
+                                           timeout=SCRIPT_TIMEOUT)
             if not check.passed:
                 return SolveResult.unsupported(f"{model} fix fails tests: {_failure_summary(check.output, 300)}")
 
         digest = _digest(script_path)
         _write_atomic(target_path, patched.encode("utf-8"))
-        verified = run_python_tests(task, script, timeout=SCRIPT_TIMEOUT)
+        verified = await asyncio.to_thread(run_python_tests, task, script, timeout=SCRIPT_TIMEOUT)
         if not verified.passed or _digest(script_path) != digest:
             _write_atomic(target_path, original.encode("utf-8"))
             return SolveResult.unsupported(f"{model} fix did not verify in place; restored")
