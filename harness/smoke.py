@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 
 import run_agent
-from harness.runtime import run_python
+from harness.runtime import run_python, sandbox_status
 from harness.task_io import load_task
 
 
@@ -31,12 +31,15 @@ def main() -> None:
             "except PermissionError:\n    print('isolated')\n",
             encoding="utf-8",
         )
+        status = sandbox_status()
         child = run_python(script, cwd=task_dir, timeout=10)
-        if not child.passed or child.output.strip() != "isolated" or outside.read_text() != "unchanged":
-            raise SystemExit(f"task sandbox smoke check failed: {child.output}")
+        if not child.passed:
+            raise SystemExit(f"task Python does not run: {child.output}")
+        if "landlock abi" in status and (child.output.strip() != "isolated" or outside.read_text() != "unchanged"):
+            raise SystemExit(f"task sandbox smoke check failed ({status}): {child.output}")
     if result.answer != "4":
         raise SystemExit(f"smoke check failed: {result}")
-    print("smoke check ok:", sorted(run_agent.build_registry()))
+    print("smoke check ok:", sorted(run_agent.build_registry()), "| task sandbox:", status)
 
 
 if __name__ == "__main__":

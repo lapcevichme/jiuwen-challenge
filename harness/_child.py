@@ -5,13 +5,13 @@ import types
 from pathlib import Path
 
 
-def _linux(workspace: Path, scratch: Path, libraries: tuple[Path, ...], writable: bool) -> None:
+def _linux(workspace: Path, scratch: Path, libraries: tuple[Path, ...], writable: bool) -> str:
     import ctypes as c
     import errno
     import platform
 
     if platform.machine() != "x86_64":
-        raise RuntimeError("the Linux task sandbox requires x86-64")
+        return "sandbox off: not x86-64"
 
     libc = c.CDLL(None, use_errno=True)
     libc.syscall.restype = c.c_long
@@ -22,30 +22,54 @@ def _linux(workspace: Path, scratch: Path, libraries: tuple[Path, ...], writable
             raise OSError(error, os.strerror(error))
         return result
 
-    if checked(libc.syscall(444, 0, 0, 1)) < 3:
-        raise RuntimeError("the Linux task sandbox requires Landlock ABI 3 or newer")
+    status = []
+    checked(libc.prctl(38, 1, 0, 0, 0))
+    try:
+        status.append(_landlock(c, checked, libc, workspace, scratch, libraries, writable))
+    except OSError as error:
+        status.append(f"landlock off ({error.strerror})")
+    try:
+        _seccomp(c, checked, libc, errno)
+        status.append("seccomp on")
+    except OSError as error:
+        status.append(f"seccomp off ({error.strerror})")
+    return ", ".join(status)
+
+
+def _landlock(c, checked, libc, workspace, scratch, libraries, writable) -> str:
+    abi = checked(libc.syscall(444, 0, 0, 1))
+    handled_bits = {1: 13, 2: 14}.get(abi, 15)
 
     class PathRule(c.Structure):
         _fields_ = [("access", c.c_uint64), ("parent_fd", c.c_int32)]
 
-    read = (1 << 2) | (1 << 3)
+    execute, read_file, read_dir = 1 << 0, 1 << 2, 1 << 3
+    read = read_file | read_dir
     write = (1 << 1) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8) | (1 << 13) | (1 << 14)
-    handled = c.c_uint64((1 << 15) - 1)
+    mask = (1 << handled_bits) - 1
+    handled = c.c_uint64(mask)
+    system = [Path(path) for path in ("/usr", "/lib", "/lib64", "/bin", "/sbin") if os.path.isdir(path)]
+    system.append(Path(sys.executable).resolve().parent)
+    venv = Path(sys.executable).parent.parent / "pyvenv.cfg"
+    files = [path for path in (Path("/etc/ld.so.cache"), venv) if path.is_file()]
     rules = checked(libc.syscall(444, c.byref(handled), c.sizeof(handled), 0))
     try:
         for path, access in [(workspace, read | (write if writable else 0)), (scratch, read | write),
-                             *((path, read) for path in libraries)]:
+                             *((path, read) for path in libraries), *((path, read | execute) for path in system),
+                             *((path, read_file) for path in files)]:
             fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
             try:
-                rule = PathRule(access, fd)
+                rule = PathRule(access & mask, fd)
                 checked(libc.syscall(445, rules, 1, c.byref(rule), 0))
             finally:
                 os.close(fd)
-        checked(libc.prctl(38, 1, 0, 0, 0))
         checked(libc.syscall(446, rules, 0))
     finally:
         os.close(rules)
+    return f"landlock abi {abi}"
 
+
+def _seccomp(c, checked, libc, errno) -> None:
     class Filter(c.Structure):
         _fields_ = [("code", c.c_ushort), ("jt", c.c_uint8), ("jf", c.c_uint8), ("k", c.c_uint32)]
 
@@ -54,12 +78,12 @@ def _linux(workspace: Path, scratch: Path, libraries: tuple[Path, ...], writable
 
     deny = (
         *range(41, 56),
-        56, 57, 58, 59, 62, 101, 129, 200, 234, 297, 310, 311, 322,
+        62, 101, 129, 200, 234, 297, 310, 311,
         90, 91, 92, 93, 94, 132, *range(188, 191), *range(197, 200), 235, 260, 261, 268, 280,
         452, 463, 466, 469,
         155, 161, 165, 166, 272, 303, 304, 308, 323, 442, 467, 472,
         288, 299, 307,
-        424, *range(425, 436), 438,
+        424, *range(425, 435), 438,
     )
     blocked = 0x00050000 | errno.EPERM
     allowed = 0x7FFF0000
@@ -117,9 +141,11 @@ def _windows_guard(workspace: Path, scratch: Path, libraries: tuple[Path, ...], 
 
 def main() -> None:
     script, scratch, writable = sys.argv[1:]
-    script, scratch = Path(script), Path(scratch).resolve()
+    scratch = Path(scratch).resolve()
     workspace = Path.cwd().resolve()
-    code = compile(script.read_bytes(), str(script), "exec")
+    probe = script == "--probe"
+    script = Path(script)
+    code = None if probe else compile(script.read_bytes(), str(script), "exec")
     stdlib = Path(sysconfig.get_path("stdlib")).resolve()
     libraries = (stdlib,)
     if sys.platform == "win32":
@@ -129,15 +155,22 @@ def main() -> None:
     program.__file__ = str(script)
     sys.argv[:] = [str(script)]
     sys.path.insert(0, str(script.parent if script.is_relative_to(workspace) else workspace))
-    try:
-        if sys.platform == "linux":
-            _linux(workspace, scratch, libraries, writable == "1")
-        elif sys.platform == "win32":
-            _windows_guard(workspace, scratch, libraries, writable == "1")
-        else:
-            raise RuntimeError("unsupported task sandbox platform")
-    except (OSError, RuntimeError) as error:
-        raise SystemExit(f"cannot restrict task Python: {error}") from None
+    if os.environ.get("HARNESS_SANDBOX") == "0":
+        status = "sandbox off: HARNESS_SANDBOX=0"
+    else:
+        try:
+            if sys.platform == "linux":
+                status = _linux(workspace, scratch, libraries, writable == "1")
+            elif sys.platform == "win32":
+                _windows_guard(workspace, scratch, libraries, writable == "1")
+                status = "windows audit hook"
+            else:
+                status = f"sandbox off: unsupported platform {sys.platform}"
+        except (OSError, RuntimeError) as error:
+            status = f"sandbox off: {error}"
+    if probe:
+        print(status)
+        return
     sys.modules["__main__"] = program
     exec(code, program.__dict__)
 

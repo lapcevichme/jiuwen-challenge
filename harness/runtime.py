@@ -1,3 +1,4 @@
+import functools
 import math
 import os
 import signal
@@ -46,6 +47,29 @@ def _stop_test(process: subprocess.Popen, env: dict[str, str]) -> None:
     process.wait()
 
 
+def _child_env() -> dict[str, str]:
+    env = {"PYTHONIOENCODING": "utf-8"}
+    if os.name == "nt" and "SystemRoot" in os.environ:
+        env["SystemRoot"] = os.environ["SystemRoot"]
+    if os.environ.get("HARNESS_SANDBOX") == "0":
+        env["HARNESS_SANDBOX"] = "0"
+    return env
+
+
+@functools.cache
+def sandbox_status() -> str:
+    try:
+        with tempfile.TemporaryDirectory(prefix="jiuwen-probe-") as scratch:
+            completed = subprocess.run(
+                [sys.executable, "-I", "-S", "-B", "-X", "utf8", str(_CHILD), "--probe", scratch, "1"],
+                cwd=scratch, env=_child_env(), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                errors="replace", timeout=20,
+            )
+        return completed.stdout.strip() or f"probe failed: {completed.stderr.strip()[-200:]}"
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"probe failed: {error}"
+
+
 def run_python_tests(task: TaskSpec, script: str | Path, *, timeout: float) -> TestResult:
     if task.workspace is None:
         raise ValueError("the task has no workspace")
@@ -60,9 +84,7 @@ def run_python(
 ) -> TestResult:
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be finite and positive")
-    env = {"PYTHONIOENCODING": "utf-8"}
-    if os.name == "nt" and "SystemRoot" in os.environ:
-        env["SystemRoot"] = os.environ["SystemRoot"]
+    env = _child_env()
     with tempfile.TemporaryDirectory(prefix="jiuwen-test-") as scratch:
         env.update(TMP=scratch, TEMP=scratch, TMPDIR=scratch)
         command = [sys.executable, "-I", "-S", "-B", "-X", "utf8", str(_CHILD),
