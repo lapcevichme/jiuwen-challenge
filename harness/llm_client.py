@@ -1,17 +1,20 @@
 import asyncio
 import json
 import logging
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 
 from harness.budget import BudgetLedger
 
 LOG = logging.getLogger("harness")
 
-Transport = Callable[[str, dict[str, str], bytes, float], tuple[int, bytes]]
+Transport = Callable[[str, dict[str, str], bytes, float], tuple[int, bytes] | tuple[int, bytes, float]]
 
 
 class LLMUnavailable(RuntimeError):
@@ -20,9 +23,10 @@ class LLMUnavailable(RuntimeError):
 
 class LLMError(RuntimeError):
 
-    def __init__(self, message: str, *, transient: bool = False):
+    def __init__(self, message: str, *, transient: bool = False, retry_after: float = 0):
         super().__init__(message)
         self.transient = transient
+        self.retry_after = retry_after
 
 
 class NotSent(OSError):
@@ -39,15 +43,27 @@ class ChatResult:
     finish_reason: str | None
 
 
-def urllib_transport(url: str, headers: dict[str, str], body: bytes, timeout: float) -> tuple[int, bytes]:
+def urllib_transport(url: str, headers: dict[str, str], body: bytes, timeout: float):
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as error:
+        if error.code == 429 and (value := error.headers.get("Retry-After")):
+            try:
+                delay = float(value)
+            except ValueError:
+                try:
+                    delay = parsedate_to_datetime(value).timestamp() - time.time()
+                except (ValueError, TypeError, OverflowError):
+                    delay = 0
+            if 0 < delay <= 3600:
+                return error.code, error.read(), delay
         return error.code, error.read()
     except urllib.error.URLError as error:
-        raise NotSent(str(error.reason)) from error
+        if isinstance(error.reason, (ConnectionRefusedError, socket.gaierror, ssl.SSLCertVerificationError)):
+            raise NotSent(str(error.reason)) from error
+        raise OSError(str(error.reason)) from error
 
 
 def estimate_tokens(text: str) -> int:
@@ -73,14 +89,20 @@ class LLMClient:
         self._failures = 0
         self._outage_started = 0.0
         self._refused = ""
+        self._cooldown_until = 0.0
 
     async def chat(
         self, model: str, messages: list[dict[str, str]], *, max_tokens: int, timeout: float, label: str = "",
+        min_tokens: int | None = None,
     ) -> ChatResult:
         deadline = time.monotonic() + timeout
+        cooldown = self._cooldown_until - time.monotonic()
+        if cooldown > 0:
+            raise LLMError("proxy Retry-After cooldown", transient=True, retry_after=cooldown)
         for attempt in range(self.rate_limit_retries + 1):
             result = await self._send(model, messages, max_tokens=max_tokens,
-                                      timeout=max(1.0, deadline - time.monotonic()), label=label)
+                                      timeout=max(0.01, deadline - time.monotonic()), label=label,
+                                      min_tokens=min_tokens)
             if result is not None:
                 return result
             pause = self.rate_limit_pause + attempt
@@ -98,7 +120,12 @@ class LLMClient:
 
     async def _send(
         self, model: str, messages: list[dict[str, str]], *, max_tokens: int, timeout: float, label: str,
+        min_tokens: int | None = None,
     ) -> ChatResult | None:
+        deadline = time.monotonic() + timeout
+        cooldown = self._cooldown_until - time.monotonic()
+        if cooldown > 0:
+            raise LLMError("proxy Retry-After cooldown", transient=True, retry_after=cooldown)
         if self._refused:
             raise LLMUnavailable(self._refused)
         if self._failures >= self.max_consecutive_failures:
@@ -106,21 +133,44 @@ class LLMClient:
             if down >= self.outage_limit:
                 raise LLMUnavailable(f"{self._failures} consecutive proxy failures over {down:.0f}s")
         if self._failures:
-            await asyncio.sleep(min(self.failure_pause * 2 ** (self._failures - 1), 15.0))
+            pause = min(self.failure_pause * 2 ** min(self._failures - 1, 10), 15.0)
+            if pause >= timeout:
+                raise LLMError("proxy backoff exceeds attempt deadline", transient=True)
+            await asyncio.sleep(pause)
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            raise LLMError("request deadline reached before send", transient=True)
         prompt_estimate = sum(estimate_tokens(message["content"]) + 8 for message in messages) + 16
-        reservation = self.ledger.reserve(prompt_estimate, max_tokens)
+        reservation, max_tokens = self.ledger.reserve_up_to(
+            prompt_estimate, max_tokens, min_output_tokens=max_tokens if min_tokens is None else min_tokens,
+        )
 
         body = json.dumps({
             "model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0,
         }).encode("utf-8")
         started = time.monotonic()
+        cancelled = False
+
+        def account(cost: int, status: str, known: bool) -> None:
+            LOG.info("LLM_USAGE %s", json.dumps({"task": label, "model": model, "cost": cost / 10,
+                     "status": status, "known": known, "max_tokens": max_tokens,
+                     "seconds": round(time.monotonic() - started, 3)}))
+
         try:
-            status, raw = await asyncio.to_thread(self.transport, self.url, self._headers, body, timeout)
+            request = asyncio.create_task(asyncio.to_thread(self.transport, self.url, self._headers, body, timeout))
+            try:
+                received = await asyncio.shield(request)
+            except asyncio.CancelledError:
+                cancelled = True
+                received = await request
+            status, raw = received[:2]
         except BaseException as error:
             if isinstance(error, NotSent):
                 self.ledger.release(reservation)
+                account(0, "not_sent", False)
             else:
-                self.ledger.charge_unknown(reservation)
+                cost = self.ledger.charge_unknown(reservation)
+                account(cost, type(error).__name__, False)
             self._failed()
             if isinstance(error, (OSError, TimeoutError)):
                 raise LLMError(f"transport failure: {type(error).__name__}: {error}", transient=True) from error
@@ -129,9 +179,16 @@ class LLMClient:
 
         if status == 429:
             self.ledger.release(reservation)
+            account(0, "429", False)
+            if cancelled:
+                raise asyncio.CancelledError
+            if len(received) == 3 and received[2] > 0:
+                self._cooldown_until = max(self._cooldown_until, time.monotonic() + received[2])
+                raise LLMError("HTTP 429: respect Retry-After", transient=True, retry_after=received[2])
             return None
         if status != 200:
-            self.ledger.charge_unknown(reservation, input_only=True, input_tokens=prompt_estimate)
+            cost = self.ledger.charge_unknown(reservation, input_only=True, input_tokens=prompt_estimate)
+            account(cost, str(status), False)
             detail = raw[:300].decode("utf-8", "replace")
             if status in (401, 402, 403):
                 self._refused = f"proxy refused with HTTP {status}: {detail}"
@@ -143,15 +200,24 @@ class LLMClient:
         try:
             data = json.loads(raw)
             usage = data["usage"]
-            prompt_tokens, completion_tokens = int(usage["prompt_tokens"]), int(usage["completion_tokens"])
+            prompt_tokens, completion_tokens = usage["prompt_tokens"], usage["completion_tokens"]
+            if any(type(value) is not int or value < 0 for value in (prompt_tokens, completion_tokens)):
+                raise ValueError("invalid token counts")
         except (ValueError, KeyError, TypeError) as error:
-            self.ledger.charge_unknown(reservation)
+            cost = self.ledger.charge_unknown(reservation)
+            account(cost, "invalid_usage", False)
             self._failed()
             raise LLMError(f"response without usable usage: {error}") from error
-        cost = self.ledger.settle(reservation, prompt_tokens, completion_tokens) / 10
+        cost_tenths = self.ledger.settle(reservation, prompt_tokens, completion_tokens)
+        account(cost_tenths, "200", True)
+        cost = cost_tenths / 10
         self._failures = 0
+        if cancelled:
+            raise asyncio.CancelledError
         choice = (data.get("choices") or [{}])[0]
         content = (choice.get("message") or {}).get("content") or ""
+        if not isinstance(content, str):
+            raise LLMError("response content must be text")
         LOG.info(
             "LLM %s model=%s in=%d out=%d cost=%.1f %.1fs finish=%s",
             label, model, prompt_tokens, completion_tokens, cost, seconds, choice.get("finish_reason"),

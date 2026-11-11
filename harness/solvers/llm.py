@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from harness.budget import BudgetExhausted
+from harness.config import number
 from harness.contracts import SolveResult, TaskSpec
 from harness.llm_client import LLMClient, LLMError, LLMUnavailable
 from harness.runtime import run_python, run_python_tests
@@ -39,8 +40,9 @@ def trace(event: dict) -> None:
 SCRIPT_NAME = "llm_solution.py"
 SCRIPT_TIMEOUT = 10.0
 _EVENT: contextvars.ContextVar[dict] = contextvars.ContextVar("llm_event")
+_DEADLINE: contextvars.ContextVar[float] = contextvars.ContextVar("llm_deadline")
 CONTEXT_CHARS = 4000
-FULL_CONTEXT_CHARS = int(os.environ.get("LLM_FULL_CONTEXT_CHARS") or 6000)
+FULL_CONTEXT_CHARS = number("LLM_FULL_CONTEXT_CHARS", 6000, maximum=100000)
 TEXT_SUFFIXES = (".csv", ".tsv", ".md", ".txt", ".json", ".yaml", ".yml")
 CSV = (".csv", ".tsv")
 
@@ -59,8 +61,10 @@ SCRIPT_SYSTEM = (
     "print only the final answer. Output only code."
 )
 CODING_SYSTEM = (
-    "Fix the bugs in the module so that the tests pass; do not change the tests. "
-    "Output only the corrected top-level functions or classes as Python code, complete definitions, no comments."
+    "Fix the module according to the task and its documented contract. Visible tests are examples, not the "
+    "complete specification. Preserve the API, required return types and behavior on edge cases; do not "
+    "hardcode test inputs or change tests. Output only complete corrected top-level definitions and any "
+    "necessary imports or module constants as Python code. Keep unchanged definitions out of the reply."
 )
 
 
@@ -77,6 +81,11 @@ class Models:
     strong: str = "qwen3.8-27b"
     fast_max_tokens: int = 800
     strong_max_tokens: int = 4000
+
+    def __post_init__(self):
+        allowed = {"qwen3.8-27b", "qwen3.8-27b-noreason", "qwen3.6-35b-a3b", "qwen3.6-35b-a3b-noreason"}
+        if self.fast not in allowed or self.strong not in allowed:
+            raise ValueError("LLM_MODEL and LLM_STRONG_MODEL must be competition-approved models")
 
 
 def question(instruction: str) -> str:
@@ -127,6 +136,11 @@ def workspace_context(workspace: Path | None) -> str:
 
 
 _NO_VALUE = {"none", "null", "nan", "undefined", "n/a", "[]", "{}", "''", '""'}
+_LOOKUP_FAILURE = re.compile(
+    r"(?:(?:person|company|employer|record|entity|value|answer|file|data|match|field|column|key)\s+)?not found[.!]?|"
+    r"no (?:matching )?(?:person|records?|entities|values?|answers?|files?|data|matches|results?)(?: found)?[.!]?",
+    re.IGNORECASE,
+)
 
 
 def normalize_answer(output: str, check: str | None) -> str | None:
@@ -134,11 +148,11 @@ def normalize_answer(output: str, check: str | None) -> str | None:
     if not lines:
         return None
     answer = lines[-1]
-    if len(answer) > 200 or answer.casefold() in _NO_VALUE:
+    if len(answer) > 200 or answer.casefold() in _NO_VALUE or _LOOKUP_FAILURE.fullmatch(answer):
         return None
     if check == "exact_int":
-        match = re.fullmatch(r"(-?[0-9]+)(?:\.0+)?", answer.replace(",", ""))
-        return match[1] if match else None
+        match = re.fullmatch(r"([+-]?(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+))(?:\.0+)?", answer)
+        return str(int(match[1].replace(",", ""))) if match else None
     return answer
 
 
@@ -151,6 +165,16 @@ def _scratch_copy(task: TaskSpec, scratch: Path) -> Path:
     return root
 
 
+async def _execute(function, *args, **kwargs):
+    kwargs["timeout"] = max(0.01, min(kwargs["timeout"], _DEADLINE.get() - time.monotonic()))
+    operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        await operation
+        raise
+
+
 def _splice(module: str, patch: str) -> str | None:
     try:
         tree, new = ast.parse(module), ast.parse(patch)
@@ -158,31 +182,76 @@ def _splice(module: str, patch: str) -> str | None:
         return None
     lines = module.splitlines(keepends=True)
     patch_lines = patch.splitlines(keepends=True)
+    def names(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return [node.name]
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+        return [target.id for target in targets] if all(isinstance(target, ast.Name) for target in targets) else []
+
     spans = {}
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            start = min([node.lineno] + [decorator.lineno for decorator in node.decorator_list])
-            spans[node.name] = (start - 1, node.end_lineno)
-    replacements, imports, extra = [], [], []
+        for name in names(node):
+            start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+            spans[name] = (start - 1, node.end_lineno)
+    replacements, imports, futures, globals_, extra = [], [], [], [], []
+    changed = set()
     for node in new.body:
         start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
         text = "".join(patch_lines[start - 1:node.end_lineno]).rstrip() + "\n"
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node.name in spans:
-                replacements.append((spans[node.name], text))
+        identifiers = names(node)
+        if identifiers:
+            if changed.intersection(identifiers):
+                return None
+            changed.update(identifiers)
+            existing = {spans[name] for name in identifiers if name in spans}
+            if len(existing) > 1:
+                return None
+            if existing:
+                span = existing.pop()
+                if any(span == old for old, _ in replacements):
+                    return None
+                replacements.append((span, text))
             else:
-                extra.append(text)
+                (globals_ if isinstance(node, (ast.Assign, ast.AnnAssign)) else extra).append(text)
         elif isinstance(node, (ast.Import, ast.ImportFrom)) and text not in module:
-            imports.append(text)
-    if not replacements and not extra:
+            (futures if isinstance(node, ast.ImportFrom) and node.module == "__future__" else imports).append(text)
+    if not replacements and not extra and not globals_ and not imports and not futures:
         return None
     for (start, end), text in sorted(replacements, reverse=True):
         lines[start:end] = [text]
-    result = "".join(imports) + "".join(lines)
+    result = "".join(lines)
     if extra:
         result = result.rstrip() + "\n\n\n" + "\n\n".join(extra)
     try:
-        ast.parse(result)
+        updated = ast.parse(result)
+        insert = 0
+        for index, node in enumerate(updated.body):
+            if ((index == 0 and isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+                 and isinstance(node.value.value, str))
+                    or isinstance(node, ast.ImportFrom) and node.module == "__future__"):
+                insert = node.end_lineno
+            else:
+                break
+        lines = result.splitlines(keepends=True)
+        if insert and not lines[insert - 1].endswith("\n"):
+            lines[insert - 1] += "\n"
+        lines[insert:insert] = futures + imports
+        result = "".join(lines)
+        if globals_:
+            setup_end = 0
+            for index, node in enumerate(ast.parse(result).body):
+                if (isinstance(node, (ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign))
+                        or index == 0 and isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+                        and isinstance(node.value.value, str)):
+                    setup_end = node.end_lineno
+                else:
+                    break
+            lines = result.splitlines(keepends=True)
+            if setup_end and not lines[setup_end - 1].endswith("\n"):
+                lines[setup_end - 1] += "\n"
+            lines[setup_end:setup_end] = globals_
+        result = "".join(lines)
+        compile(result, "<patched-module>", "exec")
     except SyntaxError:
         return None
     return result
@@ -214,18 +283,34 @@ def _failure_summary(output: str, limit: int = 1500) -> str:
 
 
 class LLMFallback:
-    def __init__(self, client: LLMClient, models: Models = Models(), *, trust_fast_unsolvable: bool = True):
+    def __init__(self, client: LLMClient, models: Models = Models(), *, trust_fast_unsolvable: bool = True,
+                 adaptive_output: bool = True):
         self.client = client
         self.models = models
         self.trust_fast_unsolvable = trust_fast_unsolvable
+        self.adaptive_output = adaptive_output
+        self._previous_code: dict[Path, str] = {}
+        self._contexts: dict[Path, str] = {}
+
+    def _context(self, task: TaskSpec) -> str:
+        if task.task_dir not in self._contexts:
+            self._contexts[task.task_dir] = workspace_context(task.workspace)
+        return self._contexts[task.task_dir]
+
+    def _feedback(self, task: TaskSpec, feedback: str) -> str:
+        if not feedback:
+            return ""
+        code = self._previous_code.get(task.task_dir, "")
+        return (f"\n\nPrevious attempt failed: {feedback}"
+                + (f"\nPrevious code (may be incomplete):\n{code}" if code else ""))
 
     def estimate(self, task: TaskSpec, attempt: int) -> float:
         if task.task_type == "coding":
             directory = task.workspace or task.task_dir
-            chars = sum(path.stat().st_size for path in directory.rglob("*.py")
+            chars = len(task.instruction) + sum(path.stat().st_size for path in directory.rglob("*.py")
                         if not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(directory))
         else:
-            chars = len(task.instruction) + len(workspace_context(task.workspace))
+            chars = len(task.instruction) + len(self._context(task))
         output = EXPECTED_OUTPUT[min(attempt, 2)].get(task.task_type, 300)
         return (len(SCRIPT_SYSTEM) + chars) / CHARS_PER_INPUT_TOKEN / 10 + output
 
@@ -235,6 +320,7 @@ class LLMFallback:
         max_tokens = self.models.strong_max_tokens if strong else self.models.fast_max_tokens
         feedback = previous.detail[:400] if attempt >= 2 else ""
         _EVENT.set({"task": task.task_id, "type": task.task_type, "attempt": attempt, "model": model})
+        _DEADLINE.set(time.monotonic() + timeout)
         try:
             if task.task_type == "coding":
                 result = await self._coding(task, model, max_tokens, timeout, feedback)
@@ -249,15 +335,22 @@ class LLMFallback:
         except LLMError as error:
             if error.transient:
                 trace({**_EVENT.get(), "status": "RETRY_LATER", "detail": str(error)[:300]})
-                raise FallbackRetryLater(str(error)) from error
+                raise FallbackRetryLater(str(error), retry_after=error.retry_after) from error
             result = SolveResult.unsupported(f"LLM request failed: {error}")
         trace({**_EVENT.get(), "status": result.status.value, "answer": result.answer, "detail": result.detail[:500]})
+        if result.answer is not None or strong:
+            self._previous_code.pop(task.task_dir, None)
         return result
 
     async def _chat(self, model: str, system: str, prompt: str, max_tokens: int, timeout: float, label: str):
+        reserve = 2 * SCRIPT_TIMEOUT if _EVENT.get()["type"] == "coding" else SCRIPT_TIMEOUT
+        timeout = min(timeout, _DEADLINE.get() - time.monotonic() - reserve)
+        if timeout <= 0:
+            raise LLMError("no time left for generation and verification", transient=True)
         reply = await self.client.chat(
             model, [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
             max_tokens=max_tokens, timeout=timeout, label=label,
+            min_tokens=min(max_tokens, 256 if model.endswith("-noreason") else 768) if self.adaptive_output else None,
         )
         _EVENT.get().update(prompt=prompt, reply=reply.content, cost=reply.cost, input_tokens=reply.prompt_tokens,
                            output_tokens=reply.completion_tokens, seconds=round(reply.seconds, 2))
@@ -265,15 +358,17 @@ class LLMFallback:
 
     async def _script(self, task, model, max_tokens, timeout, feedback, *, final) -> SolveResult:
         prompt = question(task.instruction)
-        context = workspace_context(task.workspace)
+        context = self._context(task)
         if context:
             prompt += "\n\n" + context
-        if feedback:
-            prompt += f"\n\nA previous attempt failed: {feedback}"
+        prompt += self._feedback(task, feedback)
         reply = await self._chat(model, SCRIPT_SYSTEM, prompt, max_tokens, max(1.0, timeout - SCRIPT_TIMEOUT),
                                  task.task_id)
+        self._previous_code[task.task_dir] = extract_code(reply.content)[:6000]
+        if reply.finish_reason == "length":
+            return SolveResult.unsupported(f"{model} output truncated before completion")
         if reply.content.strip().strip("`").strip().upper().rstrip(".") == "UNSOLVABLE":
-            if final or (self.trust_fast_unsolvable and task.task_type != "search"):
+            if final or (self.trust_fast_unsolvable and task.task_type == "math" and task.workspace is None):
                 return SolveResult.unsolvable(f"{model} finds information missing for an exact answer")
             return SolveResult.unsupported(f"{model} replied UNSOLVABLE")
         code = extract_code(reply.content)
@@ -283,7 +378,7 @@ class LLMFallback:
             root = _scratch_copy(task, Path(scratch))
             script = Path(scratch) / SCRIPT_NAME
             script.write_text(code, encoding="utf-8")
-            result = await asyncio.to_thread(run_python, script, cwd=root, timeout=SCRIPT_TIMEOUT)
+            result = await _execute(run_python, script, cwd=root, timeout=SCRIPT_TIMEOUT)
         _EVENT.get()["script_output"] = result.output[-500:]
         if not result.passed:
             reason = "timed out" if result.timed_out else _failure_summary(result.output, 300) or "failed"
@@ -309,18 +404,20 @@ class LLMFallback:
         tests = script_path.read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory(prefix="jiuwen-llm-") as scratch:
             root = _scratch_copy(task, Path(scratch))
-            baseline = await asyncio.to_thread(run_python_tests, replace(task, workspace=root), script,
-                                              timeout=SCRIPT_TIMEOUT)
+            baseline = await _execute(run_python_tests, replace(task, workspace=root), script,
+                                      timeout=SCRIPT_TIMEOUT)
             if baseline.passed:
                 return SolveResult.solved("DONE", "original tests already pass")
             prompt = (
-                f"Module {target}:\n{original}\n\nTests {script}:\n{tests}\n\n"
+                f"Task:\n{question(task.instruction)}\n\nModule {target}:\n{original}\n\nTests {script}:\n{tests}\n\n"
                 f"Failures:\n{_failure_summary(baseline.output)}"
             )
-            if feedback:
-                prompt += f"\n\nA previous fix failed: {feedback}"
+            prompt += self._feedback(task, feedback)
             reply = await self._chat(model, CODING_SYSTEM, prompt, max_tokens,
                                      max(1.0, timeout - 2 * SCRIPT_TIMEOUT), task.task_id)
+            self._previous_code[task.task_dir] = extract_code(reply.content)[:6000]
+            if reply.finish_reason == "length":
+                return SolveResult.unsupported(f"{model} repair truncated before completion")
             patched = _splice(original, extract_code(reply.content))
             if patched is None:
                 return SolveResult.unsupported(f"{model} reply has no usable definitions")
@@ -328,15 +425,30 @@ class LLMFallback:
             if gaming:
                 return SolveResult.unsupported(f"{model} {gaming}; rejected as test gaming")
             resolve_inside(root, target).write_text(patched, encoding="utf-8")
-            check = await asyncio.to_thread(run_python_tests, replace(task, workspace=root), script,
-                                           timeout=SCRIPT_TIMEOUT)
+            check = await _execute(run_python_tests, replace(task, workspace=root), script,
+                                   timeout=SCRIPT_TIMEOUT)
             if not check.passed:
                 return SolveResult.unsupported(f"{model} fix fails tests: {_failure_summary(check.output, 300)}")
 
-        digest = _digest(script_path)
-        _write_atomic(target_path, patched.encode("utf-8"))
-        verified = await asyncio.to_thread(run_python_tests, task, script, timeout=SCRIPT_TIMEOUT)
-        if not verified.passed or _digest(script_path) != digest:
+        def commit():
+            digest = _digest(script_path)
+            accepted = False
+            try:
+                _write_atomic(target_path, patched.encode("utf-8"))
+                verified = run_python_tests(task, script, timeout=SCRIPT_TIMEOUT)
+                accepted = verified.passed and _digest(script_path) == digest
+                return accepted
+            finally:
+                if not accepted:
+                    _write_atomic(target_path, original.encode("utf-8"))
+
+        operation = asyncio.create_task(asyncio.to_thread(commit))
+        try:
+            accepted = await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            await operation
             _write_atomic(target_path, original.encode("utf-8"))
+            raise
+        if not accepted:
             return SolveResult.unsupported(f"{model} fix did not verify in place; restored")
         return SolveResult.solved("DONE", f"{model} fix, cost {reply.cost:.1f} tokens")

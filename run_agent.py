@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from harness.contracts import Solver, TaskSpec
+from harness.config import number
 from harness.scheduler import run_tasks
 from harness.task_io import load_task, resolve_inside
 
@@ -82,22 +83,29 @@ def build_fallback():
     except ValueError:
         LOG.warning("invalid BUDGET %r; using %d", os.environ.get("BUDGET"), DEFAULT_BUDGET)
         ledger = BudgetLedger(DEFAULT_BUDGET)
-    models = Models(
-        fast=os.environ.get("LLM_MODEL") or Models.fast,
-        strong=os.environ.get("LLM_STRONG_MODEL") or Models.strong,
-    )
+    try:
+        models = Models(
+            fast=os.environ.get("LLM_MODEL") or Models.fast,
+            strong=os.environ.get("LLM_STRONG_MODEL") or Models.strong,
+            fast_max_tokens=number("LLM_FAST_MAX_TOKENS", Models.fast_max_tokens, minimum=128, maximum=16000),
+            strong_max_tokens=number("LLM_STRONG_MAX_TOKENS", Models.strong_max_tokens, minimum=128, maximum=16000),
+        )
+    except ValueError:
+        LOG.warning("unapproved LLM model override; using competition defaults")
+        models = Models()
     trust = os.environ.get("LLM_TRUST_FAST_UNSOLVABLE", "1") != "0"
-    return LLMFallback(LLMClient(base_url, api_key, ledger), models, trust_fast_unsolvable=trust), ledger
+    return LLMFallback(LLMClient(base_url, api_key, ledger), models, trust_fast_unsolvable=trust,
+                       adaptive_output=os.environ.get("LLM_ADAPTIVE_OUTPUT", "1") != "0"), ledger
 
 
 def build_limits() -> "ScheduleLimits":
     from harness.scheduler import ScheduleLimits
 
-    try:
-        return ScheduleLimits(fallback_concurrency=int(os.environ.get("LLM_CONCURRENCY") or DEFAULT_CONCURRENCY))
-    except ValueError:
-        LOG.warning("invalid LLM_CONCURRENCY %r; using %d", os.environ.get("LLM_CONCURRENCY"), DEFAULT_CONCURRENCY)
-        return ScheduleLimits(fallback_concurrency=DEFAULT_CONCURRENCY)
+    return ScheduleLimits(
+        fallback_concurrency=number("LLM_CONCURRENCY", DEFAULT_CONCURRENCY, minimum=1, maximum=5),
+        fallback_timeout=number("LLM_FAST_TIMEOUT", 45.0, minimum=1, maximum=600),
+        strong_timeout=number("LLM_STRONG_TIMEOUT", 120.0, minimum=1, maximum=600),
+    )
 
 
 async def _run(root: Path, deadline: float) -> None:

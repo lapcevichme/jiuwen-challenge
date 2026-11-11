@@ -1,4 +1,7 @@
+import asyncio
 from collections.abc import Mapping
+
+from openjiuwen.core.session.config.base import WORKFLOW_EXECUTE_TIMEOUT
 
 from openjiuwen.core.workflow import (
     End,
@@ -20,7 +23,7 @@ class _SolveComponent(WorkflowComponent):
         self.solver = solver
 
     async def invoke(self, inputs, session, context):
-        result = self.solver(self.task)
+        result = await asyncio.to_thread(self.solver, self.task)
         return {"result": {
             "status": result.status.value,
             "answer": result.answer,
@@ -42,7 +45,7 @@ class SolverWorkflow:
         flow.set_end_comp("end", End(), inputs_schema={"result": "${solve.result}"})
         flow.add_connection("start", "solve")
         flow.add_connection("solve", "end")
-        output = await flow.invoke({}, session=create_workflow_session())
+        output = await flow.invoke({}, session=create_workflow_session(envs={WORKFLOW_EXECUTE_TIMEOUT: 75}))
         if output.state is not WorkflowExecutionState.COMPLETED:
             return SolveResult.error(f"workflow ended with state {output.state.value}")
         result = output.result["output"]["result"]

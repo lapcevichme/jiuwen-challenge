@@ -20,6 +20,7 @@ from harness.runtime import TestResult, run_python, run_python_tests
 from harness.task_io import resolve_inside
 
 TIME_LIMIT = 60.0
+PRECHECK_TIMEOUT = 2.0
 MAX_ROUNDS = 8
 MAX_PAIR_RUNS = 400
 MAX_PROBES = 40
@@ -716,10 +717,11 @@ def precheck(task: TaskSpec) -> SolveResult:
     with tempfile.TemporaryDirectory(prefix="jiuwen-precheck-") as scratch:
         root = Path(scratch) / "workspace"
         shutil.copytree(task.workspace, root, symlinks=True)
-        result = run_python_tests(replace(task, workspace=root), script, timeout=30.0)
+        result = run_python_tests(replace(task, workspace=root), script, timeout=PRECHECK_TIMEOUT)
     if result.passed:
         return SolveResult.solved("DONE", "original tests already pass")
-    return SolveResult.unsupported("original tests fail; repair needed")
+    return SolveResult.unsupported("precheck timed out; needs longer verification or repair" if result.timed_out
+                                   else "original tests fail; repair needed")
 
 
 def solve(task: TaskSpec) -> SolveResult:
@@ -759,15 +761,18 @@ def solve(task: TaskSpec) -> SolveResult:
         return SolveResult.unsupported(f"no verified repair within limits after {bench.runs} test runs")
 
     repaired, applied = found
+    accepted = False
     try:
         if repaired != body:
             _write_atomic(target_path, bom + repaired)
         result = run_python_tests(task, script, timeout=max(bench.timeout, 10.0))
         if not result.passed or _digest(script_path) != script_digest:
-            if repaired != body:
-                _write_atomic(target_path, original)
             return SolveResult.unsupported("repair did not pass the original tests in place; restored")
+        accepted = True
     except (OSError, ValueError) as error:
         return SolveResult.error(f"cannot apply repair: {error}")
+    finally:
+        if not accepted and repaired != body:
+            _write_atomic(target_path, original)
     detail = "; ".join(applied) if applied else "original tests already pass"
     return SolveResult.solved("DONE", f"{detail} ({bench.runs} test runs)")

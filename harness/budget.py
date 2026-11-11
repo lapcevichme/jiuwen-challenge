@@ -6,7 +6,10 @@ TENTHS = 10
 
 
 class BudgetExhausted(RuntimeError):
-    pass
+
+    def __init__(self, message: str, *, temporary: bool = False):
+        super().__init__(message)
+        self.temporary = temporary
 
 
 @dataclass
@@ -28,6 +31,7 @@ class BudgetLedger:
         self.input_tokens = 0
         self.output_tokens = 0
         self.unknown_usage = 0
+        self.unknown_cost = 0
         self._lock = threading.Lock()
 
     @property
@@ -36,16 +40,32 @@ class BudgetLedger:
             return self.limit - self.spent - self.reserved
 
     def reserve(self, input_tokens: int, max_output_tokens: int) -> Reservation:
-        amount = max(0, int(input_tokens)) + TENTHS * max(0, int(max_output_tokens))
+        return self.reserve_up_to(input_tokens, max_output_tokens, min_output_tokens=max_output_tokens)[0]
+
+    def reserve_up_to(self, input_tokens: int, max_output_tokens: int, *,
+                      min_output_tokens: int) -> tuple[Reservation, int]:
+        if any(type(value) is not int or value < 0 for value in (input_tokens, max_output_tokens, min_output_tokens)):
+            raise ValueError("token counts must be non-negative integers")
+        if min_output_tokens > max_output_tokens:
+            raise ValueError("minimum output exceeds maximum")
+        amount = input_tokens + TENTHS * max_output_tokens
         with self._lock:
-            if self.spent + self.reserved + amount > self.limit:
+            available = self.limit - self.spent - self.reserved
+            minimum = input_tokens + TENTHS * min_output_tokens
+            if available < amount and self.reserved and minimum <= self.limit - self.spent:
+                raise BudgetExhausted("waiting for in-flight reservations to settle", temporary=True)
+            if available < minimum:
                 raise BudgetExhausted(
-                    f"need {amount / TENTHS:.0f} tokens, {(self.limit - self.spent - self.reserved) / TENTHS:.0f} left"
+                    f"need at least {minimum / TENTHS:.0f} tokens, {available / TENTHS:.0f} left"
                 )
+            output = min(max_output_tokens, (available - input_tokens) // TENTHS)
+            amount = input_tokens + TENTHS * output
             self.reserved += amount
-        return Reservation(amount)
+        return Reservation(amount), output
 
     def settle(self, reservation: Reservation, input_tokens: int, output_tokens: int) -> int:
+        if any(type(value) is not int or value < 0 for value in (input_tokens, output_tokens)):
+            raise ValueError("usage must contain non-negative integer token counts")
         cost = int(input_tokens) + TENTHS * int(output_tokens)
         with self._lock:
             self._release(reservation)
@@ -64,6 +84,7 @@ class BudgetLedger:
             self.spent += cost
             self.calls += 1
             self.unknown_usage += 1
+            self.unknown_cost += cost
         return cost
 
     def release(self, reservation: Reservation) -> None:
@@ -80,5 +101,6 @@ class BudgetLedger:
         with self._lock:
             return (
                 f"TOKENS spent={self.spent / TENTHS:.1f} input={self.input_tokens} output={self.output_tokens} "
-                f"calls={self.calls} unknown_usage={self.unknown_usage} limit={self.limit / TENTHS:.0f}"
+                f"calls={self.calls} unknown_usage={self.unknown_usage} unknown_cost={self.unknown_cost / TENTHS:.1f} "
+                f"reserved={self.reserved / TENTHS:.1f} limit={self.limit / TENTHS:.0f}"
             )
