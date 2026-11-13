@@ -732,13 +732,14 @@ def precheck(task: TaskSpec) -> SolveResult:
         root = Path(scratch) / "workspace"
         shutil.copytree(task.workspace, root, symlinks=True)
         result = run_python_tests(replace(task, workspace=root), script, timeout=PRECHECK_TIMEOUT)
-        if not result.passed and not result.timed_out:
+        if not result.passed:
             patches = {}
             for target in targets:
                 path = resolve_inside(task.workspace, target)
                 original = path.read_bytes()
                 candidate = isolated_defaults(original)
-                shaped = shape_repairs.candidate(candidate or original, test_source)
+                module = ".".join(Path(target).with_suffix("").parts)
+                shaped = shape_repairs.candidate(candidate or original, test_source, module)
                 candidate = shaped or candidate
                 if candidate is not None:
                     (root / target).write_bytes(candidate)

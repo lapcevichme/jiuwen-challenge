@@ -1,6 +1,8 @@
 import ast
 import codecs
 
+from harness.solvers import calendar_repairs, roman_repairs, run_length
+
 
 def _shape(node):
     return ast.dump(node, include_attributes=False)
@@ -64,35 +66,62 @@ def _determinant_edits(fn):
         if not isinstance(expr.op, ast.Sub):
             continue
         target = ast.parse(correct, mode="eval").body
-        for index in ast.walk(target):
-            if isinstance(index, ast.Subscript) and isinstance(index.slice, ast.Constant):
-                index.slice.value ^= 1
-                match = _shape(expr) == _shape(target)
-                index.slice.value ^= 1
-                if match:
-                    yield expr, correct
-                    return
+
+        def coordinates(node):
+            leaves = [n for n in ast.walk(node) if isinstance(n, ast.Subscript)]
+            if any(not isinstance(n.slice, ast.Constant) or type(n.slice.value) is not int
+                   or n.slice.value not in {0, 1} for n in leaves):
+                return None
+            indices = [n.slice.value for n in leaves]
+            for n in leaves:
+                n.slice.value = 0
+            return indices
+
+        original_shape = ast.parse(ast.unparse(expr), mode="eval").body
+        actual, expected = coordinates(original_shape), coordinates(target)
+        if actual is not None and actual != expected and _shape(original_shape) == _shape(target):
+            yield expr, correct
 
 
-def candidate(original: bytes, tests: bytes) -> bytes | None:
+def candidate(original: bytes, tests: bytes, module: str) -> bytes | None:
     bom = codecs.BOM_UTF8 if original.startswith(codecs.BOM_UTF8) else b""
     body = original[len(bom):]
     try:
-        tree = ast.parse(body)
+        source = body.decode("utf-8")
+        tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return None
-    edits = []
+    edits = list(roman_repairs.edits(tree, tests))
     for fn in tree.body:
         if isinstance(fn, ast.FunctionDef) and fn.name.encode() in tests:
             edits.extend(_transpose_edits(fn))
             edits.extend(_determinant_edits(fn))
-    if not edits:
+    ranges = [(node, node, text) for node, text in edits]
+    if any(isinstance(fn, ast.FunctionDef) and fn.name in {
+        "is_leap_year", "time_to_seconds", "parse_time", "add_days", "format_utc_offset",
+        "format_duration", "humanize_duration"
+    } for fn in tree.body):
+        ranges.extend(calendar_repairs.edits(tree, tests, source))
+    if b".isdigit()" in body and b"assertEqual" in tests:
+        try:
+            ranges.extend(run_length.edits(tree, ast.parse(tests), module))
+        except (SyntaxError, ValueError):
+            pass
+    if not ranges:
         return None
     offsets = [0]
     for line in body.splitlines(keepends=True):
         offsets.append(offsets[-1] + len(line))
-    for node, text in sorted(edits, key=lambda pair: (pair[0].lineno, pair[0].col_offset), reverse=True):
-        start = offsets[node.lineno - 1] + node.col_offset
-        end = offsets[node.end_lineno - 1] + node.end_col_offset
+    previous_start = len(body)
+    for first, last, text in sorted(ranges, key=lambda item: (item[0].lineno, item[0].col_offset), reverse=True):
+        start = offsets[first.lineno - 1] + first.col_offset
+        end = offsets[last.end_lineno - 1] + last.end_col_offset
+        if end > previous_start:
+            return None
         body = body[:start] + text.encode() + body[end:]
+        previous_start = start
+    try:
+        compile(body, "<candidate>", "exec")
+    except (SyntaxError, ValueError):
+        return None
     return bom + body
