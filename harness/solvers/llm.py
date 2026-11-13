@@ -19,7 +19,7 @@ from harness.contracts import SolveResult, TaskSpec
 from harness.llm_client import LLMClient, LLMError, LLMUnavailable
 from harness.runtime import run_python, run_python_tests
 from harness.scheduler import FallbackRetryLater, FallbackUnavailable
-from harness.solvers import class_patches, math_checks, numeric_examples, roundtrips, search_evidence
+from harness.solvers import class_patches, csv_query, math_checks, numeric_examples, roundtrips, search_evidence
 from harness.solvers.coding import _digest, _literal_calls, _locate, _write_atomic
 from harness.task_io import resolve_inside
 
@@ -525,11 +525,14 @@ class LLMFallback:
             if answer is not None and normalize_answer(answer, task.check) is not None:
                 return SolveResult.solved(answer, f"{model} selected source evidence")
             return SolveResult.unsupported("source lines did not establish an answer; solve from the files")
+        tables = task.task_type == "data_analysis" and not final and csv_query.eligible(task.workspace, prompt)
         context = self._context(task)
         if context:
             prompt += "\n\n" + context
         prompt += self._feedback(task, feedback)
         system = MATH_SYSTEM if task.task_type == "math" else SCRIPT_SYSTEM
+        if tables:
+            system = csv_query.SYSTEM
         reply = await self._chat(model, system, prompt, max_tokens, max(1.0, timeout - SCRIPT_TIMEOUT), task.task_id)
         self._previous_code[task.task_dir] = extract_code(reply.content)[:6000]
         if reply.finish_reason == "length":
@@ -544,6 +547,16 @@ class LLMFallback:
             if answer is not None:
                 return SolveResult.solved(answer, f"{model} returned a value shown in the search context")
         code = extract_code(reply.content)
+        query = csv_query.extract(reply.content) if tables else None
+        if query is not None:
+            result = await _execute(run_python, Path(csv_query.__file__), cwd=task.workspace, writable=False,
+                                    input_data=json.dumps(query), timeout=SCRIPT_TIMEOUT)
+            _EVENT.get()["script_output"] = result.output[-500:]
+            answer = normalize_answer(result.output, task.check) if result.passed else None
+            if answer is not None:
+                return SolveResult.solved(answer, f"{model} SQL query, cost {reply.cost:.1f} tokens")
+            detail = result.output.strip().splitlines()[-1:] or ["empty result"]
+            return SolveResult.unsupported(f"SQL could not produce a scalar: {detail[0][:250]}")
         if not code:
             return SolveResult.unsupported(f"{model} returned no code")
         with tempfile.TemporaryDirectory(prefix="jiuwen-llm-") as scratch:
