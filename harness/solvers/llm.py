@@ -451,9 +451,11 @@ class LLMFallback:
         if task.task_type != "search" or task.check not in ("exact_str", "exact_int"):
             return None
         if task.task_dir not in self._evidence:
-            self._evidence[task.task_dir] = search_evidence.Evidence.read(task.workspace, FULL_CONTEXT_CHARS)
+            self._evidence[task.task_dir] = search_evidence.Evidence.read(
+                task.workspace, FULL_CONTEXT_CHARS, question(task.instruction),
+            )
         evidence = self._evidence[task.task_dir]
-        if evidence is not None and task.check == "exact_int" and evidence.has_tables:
+        if evidence is not None and task.check == "exact_int" and evidence.has_tables and not evidence.focused:
             return None
         return evidence
 
@@ -489,8 +491,8 @@ class LLMFallback:
                 output = max(55, min(450, implementation_bytes / 4))
         elif attempt == 1 and (evidence := self._search_evidence(task)) is not None:
             chars = len(prompt) + len(evidence.prompt)
-            system = search_evidence.SYSTEM
-            output = 60 if task.check == "exact_str" else 120
+            system = search_evidence.LOOKUP_SYSTEM if evidence.focused else search_evidence.SYSTEM
+            output = 35 if evidence.focused else (60 if task.check == "exact_str" else 120)
         else:
             chars = len(prompt) + len(self._context(task))
             if task.task_type == "math":
@@ -558,10 +560,11 @@ class LLMFallback:
         prompt = question(task.instruction)
         evidence = None if final else self._search_evidence(task)
         if evidence is not None:
-            reply = await self._chat(model, search_evidence.SYSTEM, prompt + "\n\n" + evidence.prompt,
+            system = search_evidence.LOOKUP_SYSTEM if evidence.focused else search_evidence.SYSTEM
+            reply = await self._chat(model, system, prompt + "\n\n" + evidence.prompt,
                                      max_tokens, timeout, task.task_id)
             answer = None if reply.finish_reason == "length" else evidence.answer(reply.content, task.check, prompt)
-            if answer is None and task.check == "exact_str" and reply.finish_reason != "length":
+            if answer is None and not evidence.focused and task.check == "exact_str" and reply.finish_reason != "length":
                 answer = _grounded_search_answer(reply.content, self._context(task))
             if answer is not None and normalize_answer(answer, task.check) is not None:
                 return SolveResult.solved(answer, f"{model} selected source evidence")

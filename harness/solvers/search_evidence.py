@@ -3,6 +3,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from harness.solvers.linked_docs import connected_indices
+
 
 SYSTEM = """Answer the question using only the provided documents. Each content line has an ID in brackets.
 Read across all documents, including tables and prose. Resolve nicknames and joins first. Return one JSON object.
@@ -14,17 +16,23 @@ Use only IDs from the documents. If a necessary fact is missing, the result need
 or a count has no matches, return UNSOLVABLE to request a separate program-based check."""
 
 
+LOOKUP_SYSTEM = """Follow the named entities through the provided documents to find the requested fact.
+Reply with just {"op":"lookup","line":12,"value":"exact value from line 12"} using the final supporting line.
+Check the subject and field carefully. If these documents do not establish the answer, return UNSOLVABLE."""
+
+
 @dataclass
 class Evidence:
     prompt: str
     lines: list[str]
     has_tables: bool = False
+    focused: bool = False
 
     @classmethod
-    def read(cls, root: Path | None, limit: int) -> "Evidence | None":
+    def read(cls, root: Path | None, limit: int, question: str = "") -> "Evidence | None":
         if root is None or limit <= 0:
             return None
-        sections, lines = [], []
+        documents = []
         size = 0
         try:
             for path in sorted(root.rglob("*")):
@@ -36,21 +44,30 @@ class Evidence:
                         or path.suffix.lower() not in {".md", ".markdown", ".txt"}):
                     return None
                 size += path.stat().st_size
-                if size > limit or len(sections) >= 60:
+                if size > min(limit * (4 if question else 1), 400_000) or len(documents) >= 60:
                     return None
-                section = [f"Document {path.relative_to(root)}"]
-                for line in path.read_text(encoding="utf-8-sig").splitlines():
-                    if line.strip():
-                        lines.append(line.strip())
-                        section.append(f"[{len(lines)}] {lines[-1]}")
-                sections.append("\n".join(section))
+                content = path.read_text(encoding="utf-8-sig").splitlines()
+                documents.append((str(path.relative_to(root)), [line.strip() for line in content if line.strip()]))
         except (OSError, UnicodeError):
             return None
+        indices = connected_indices(question, documents) if question else None
+        focused = indices is not None
+        if focused:
+            documents = [documents[i] for i in indices]
+        elif size > limit:
+            return None
+        sections, lines = [], []
+        for name, content in documents:
+            section = [f"Document {name}"]
+            for line in content:
+                lines.append(line)
+                section.append(f"[{len(lines)}] {line}")
+            sections.append("\n".join(section))
         prompt = "\n\n".join(sections)
         if not lines or len(prompt) > 2 * limit:
             return None
         has_tables = any(re.fullmatch(r"\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?", line) for line in lines)
-        return cls(prompt, lines, has_tables)
+        return cls(prompt, lines, has_tables, focused)
 
     def line(self, index) -> str:
         if type(index) is not int or not 1 <= index <= len(self.lines):
@@ -75,7 +92,7 @@ class Evidence:
                     return str(_integer(line, value))
                 match = re.search(r"(?<!\w)" + re.escape(value) + r"(?!\w)", line, re.IGNORECASE)
                 return match[0] if match else None
-            if check != "exact_int":
+            if self.focused or check != "exact_int":
                 return None
             if spec.get("op") == "count":
                 ids = spec["lines"]
