@@ -66,7 +66,10 @@ MATH_SYSTEM = SCRIPT_SYSTEM + (
 )
 CODING_SYSTEM = (
     "Fix the module according to the task and its documented contract. Visible tests are examples, not the "
-    "complete specification. Preserve the API, required return types and behavior on edge cases; do not "
+    "complete specification. Inspect EVERY function, including those whose tests pass. For each, infer its "
+    "contract from the task, name, docstring and tests. Mentally try boundary values, repeated values, missing "
+    "items and empty inputs. Fix independent logic errors wherever the implementation contradicts the contract. "
+    "Preserve existing behavior where the contract is ambiguous. Preserve the API; do not "
     "hardcode test inputs or change tests. Output only complete corrected top-level definitions and any "
     "necessary imports or module constants as Python code. Keep unchanged definitions out of the reply."
 )
