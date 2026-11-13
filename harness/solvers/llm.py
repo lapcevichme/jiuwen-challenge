@@ -462,14 +462,37 @@ class LLMFallback:
                 + (f"\nPrevious code (may be incomplete):\n{code}" if code else ""))
 
     def estimate(self, task: TaskSpec, attempt: int) -> float:
+        prompt = question(task.instruction)
+        system = SCRIPT_SYSTEM
+        output = EXPECTED_OUTPUT[min(attempt, 2)].get(task.task_type, 300)
         if task.task_type == "coding":
             directory = task.workspace or task.task_dir
-            chars = len(task.instruction) + sum(path.stat().st_size for path in directory.rglob("*.py")
-                        if not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(directory))
+            source_bytes = sum(path.stat().st_size for path in directory.rglob("*.py")
+                               if not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(directory))
+            chars = len(prompt) + source_bytes
+            system = CODING_SYSTEM
+            if attempt == 1:
+                output = max(65, min(450, source_bytes / 8))
+        elif attempt == 1 and (evidence := self._search_evidence(task)) is not None:
+            chars = len(prompt) + len(evidence.prompt)
+            system = search_evidence.SYSTEM
+            output = 60 if task.check == "exact_str" else 120
         else:
-            chars = len(task.instruction) + len(self._context(task))
-        output = EXPECTED_OUTPUT[min(attempt, 2)].get(task.task_type, 300)
-        return (len(SCRIPT_SYSTEM) + chars) / CHARS_PER_INPUT_TOKEN / 10 + output
+            chars = len(prompt) + len(self._context(task))
+            if task.task_type == "math":
+                system = MATH_SYSTEM
+                if attempt == 1:
+                    output = max(50, min(220, len(prompt) / 3))
+            elif task.task_type == "data_analysis" and attempt == 1:
+                if csv_query.eligible(task.workspace, prompt):
+                    system = csv_query.SYSTEM
+                    output = 45
+                else:
+                    output = 145
+        chars += len(system)
+        if attempt >= 2:
+            chars += len(self._previous_code.get(task.task_dir, ""))
+        return chars / CHARS_PER_INPUT_TOKEN / 10 + output
 
     async def __call__(self, task: TaskSpec, previous: SolveResult, *, attempt: int, timeout: float) -> SolveResult:
         strong = attempt >= 2
