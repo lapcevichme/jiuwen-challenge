@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import tempfile
+import textwrap
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -18,7 +19,7 @@ from harness.contracts import SolveResult, TaskSpec
 from harness.llm_client import LLMClient, LLMError, LLMUnavailable
 from harness.runtime import run_python, run_python_tests
 from harness.scheduler import FallbackRetryLater, FallbackUnavailable
-from harness.solvers import roundtrips, search_evidence
+from harness.solvers import class_patches, roundtrips, search_evidence
 from harness.solvers.coding import _digest, _literal_calls, _locate, _write_atomic
 from harness.task_io import resolve_inside
 
@@ -210,7 +211,17 @@ async def _execute(function, *args, **kwargs):
 
 def _splice(module: str, patch: str) -> str | None:
     try:
+        patch = textwrap.dedent(patch)
         tree, new = ast.parse(module), ast.parse(patch)
+        merged = class_patches.merge(module, patch, tree, new)
+        if merged is None:
+            return None
+        updated, patch = merged
+        method_edits = updated != module
+        if method_edits:
+            module = updated
+            tree = ast.parse(module)
+        new = ast.parse(patch)
     except SyntaxError:
         return None
     lines = module.splitlines(keepends=True)
@@ -248,7 +259,7 @@ def _splice(module: str, patch: str) -> str | None:
                 (globals_ if isinstance(node, (ast.Assign, ast.AnnAssign)) else extra).append(text)
         elif isinstance(node, (ast.Import, ast.ImportFrom)) and text not in module:
             (futures if isinstance(node, ast.ImportFrom) and node.module == "__future__" else imports).append(text)
-    if not replacements and not extra and not globals_ and not imports and not futures:
+    if not (method_edits or replacements or extra or globals_ or imports or futures):
         return None
     for (start, end), text in sorted(replacements, reverse=True):
         lines[start:end] = [text]
@@ -312,7 +323,9 @@ _FILE_MARKER = re.compile(r"^#\s*file:\s*([^\r\n]+?)\s*$", re.MULTILINE | re.IGN
 
 def _coding_sections(content: str, targets: list[str]) -> dict[str, str]:
     if len(targets) == 1:
-        return {targets[0]: extract_code(content)}
+        blocks = _FENCE.findall(content)
+        code = "\n\n".join(textwrap.dedent(block).strip("\n") for block in blocks) if blocks else content.strip("\n")
+        return {targets[0]: code}
     code = re.sub(r"^```(?:python|py)?[ \t]*$", "", content, flags=re.MULTILINE)
     parts = _FILE_MARKER.split(code)
     sections = {}
@@ -564,6 +577,10 @@ class LLMFallback:
             if len(targets) > 1:
                 prompt += ("\nGroup corrected definitions by module. Start each group with a line "
                            "'# file: <exact filename>' followed by code. Omit unchanged modules.")
+            if any(re.search(r"^class\s+\w+", source, re.MULTILINE) for source in sources.values()):
+                prompt += ("\nFor existing classes return only changed methods in a 'class Name:' wrapper. "
+                           "Keep public signatures and optional arguments. Check state across repeated calls and "
+                           "independent instances. Keep unchanged methods out of the response.")
             prompt += await _edge_observations(task, sources, tests)
             prompt += self._feedback(task, feedback)
             reply = await self._chat(model, CODING_SYSTEM, prompt, max_tokens,
