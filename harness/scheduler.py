@@ -187,17 +187,20 @@ async def _fallback_pass(
 
         async def worker() -> None:
             nonlocal position
-            while not stopped and position < len(order):
+            while not stopped and not deferred and position < len(order):
                 task, previous = order[position]
                 position += 1
                 await attempt_one(task, previous, attempt, retry, deferred, requeue)
 
         await asyncio.gather(*(worker() for _ in range(limits.fallback_concurrency)))
-        for task, previous in deferred:
-            if stopped:
-                break
-            await attempt_one(task, previous, attempt, retry, [], requeue)
-        await worker()
+        if deferred:
+            dispatched = {id(task): index for index, (task, _) in enumerate(order[:position])}
+            for task, previous in sorted(deferred, key=lambda entry: dispatched[id(entry[0])]):
+                if stopped:
+                    break
+                await attempt_one(task, previous, attempt, retry, [], requeue)
+            deferred.clear()
+            await worker()
         if stopped:
             break
         active = retry

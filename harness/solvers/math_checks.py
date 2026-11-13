@@ -8,6 +8,12 @@ def vague_quantity(question: str) -> bool:
     return bool(_VAGUE.search(question))
 
 
+def stock_calculation(question: str) -> bool:
+    return (bool(re.search(r"\b(?:stock|inventory)\b", question, re.I))
+            and bool(re.search(r"\b(?:ships?|shipped|receives?|deliveries|dispatches|share|given away)\b",
+                               question, re.I)))
+
+
 def unused_quantity(code: str, question: str) -> str | None:
     try:
         tree = ast.parse(code)

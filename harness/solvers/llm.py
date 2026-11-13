@@ -77,6 +77,14 @@ CODING_SYSTEM = (
 )
 
 
+STOCK_SYSTEM = (
+    "Return only a short Python script. Track the stock in one variable, one update per event. "
+    "When one share is kept, replace the stock with that share. For a rounded loss, subtract the rounded loss. "
+    "If an amount or duration needed for the final count cannot be determined, return only UNSOLVABLE. "
+    "Print the final count. No explanation."
+)
+
+
 EXPECTED_OUTPUT = {
     1: {"math": 50, "data_analysis": 85, "coding": 145, "search": 235},
     2: {"math": 500, "data_analysis": 180, "coding": 500, "search": 330},
@@ -467,12 +475,18 @@ class LLMFallback:
         output = EXPECTED_OUTPUT[min(attempt, 2)].get(task.task_type, 300)
         if task.task_type == "coding":
             directory = task.workspace or task.task_dir
-            source_bytes = sum(path.stat().st_size for path in directory.rglob("*.py")
-                               if not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(directory))
+            source_bytes = implementation_bytes = 0
+            for path in directory.rglob("*.py"):
+                if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(directory):
+                    continue
+                size = path.stat().st_size
+                source_bytes += size
+                if not path.name.startswith("test_") and not path.name.endswith("_test.py"):
+                    implementation_bytes += size
             chars = len(prompt) + source_bytes
             system = CODING_SYSTEM
             if attempt == 1:
-                output = max(65, min(450, source_bytes / 8))
+                output = max(55, min(450, implementation_bytes / 4))
         elif attempt == 1 and (evidence := self._search_evidence(task)) is not None:
             chars = len(prompt) + len(evidence.prompt)
             system = search_evidence.SYSTEM
@@ -482,7 +496,11 @@ class LLMFallback:
             if task.task_type == "math":
                 system = MATH_SYSTEM
                 if attempt == 1:
-                    output = max(50, min(220, len(prompt) / 3))
+                    if task.workspace is None and math_checks.stock_calculation(prompt):
+                        system = STOCK_SYSTEM
+                        output = 20 if math_checks.vague_quantity(prompt) else 70
+                    else:
+                        output = max(50, min(220, len(prompt) / 3))
             elif task.task_type == "data_analysis" and attempt == 1:
                 if csv_query.eligible(task.workspace, prompt):
                     system = csv_query.SYSTEM
@@ -548,12 +566,18 @@ class LLMFallback:
             if answer is not None and normalize_answer(answer, task.check) is not None:
                 return SolveResult.solved(answer, f"{model} selected source evidence")
             return SolveResult.unsupported("source lines did not establish an answer; solve from the files")
+        stock = (task.task_type == "math" and not final and task.workspace is None
+                 and math_checks.stock_calculation(prompt))
         tables = task.task_type == "data_analysis" and not final and csv_query.eligible(task.workspace, prompt)
         context = self._context(task)
         if context:
             prompt += "\n\n" + context
         prompt += self._feedback(task, feedback)
         system = MATH_SYSTEM if task.task_type == "math" else SCRIPT_SYSTEM
+        if stock:
+            system = STOCK_SYSTEM
+            if self.adaptive_output and model.endswith("-noreason"):
+                max_tokens = min(max_tokens, 224)
         if tables:
             system = csv_query.SYSTEM
         reply = await self._chat(model, system, prompt, max_tokens, max(1.0, timeout - SCRIPT_TIMEOUT), task.task_id)
