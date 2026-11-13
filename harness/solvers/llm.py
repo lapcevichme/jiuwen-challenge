@@ -18,7 +18,7 @@ from harness.contracts import SolveResult, TaskSpec
 from harness.llm_client import LLMClient, LLMError, LLMUnavailable
 from harness.runtime import run_python, run_python_tests
 from harness.scheduler import FallbackRetryLater, FallbackUnavailable
-from harness.solvers import search_evidence
+from harness.solvers import roundtrips, search_evidence
 from harness.solvers.coding import _digest, _literal_calls, _locate, _write_atomic
 from harness.task_io import resolve_inside
 
@@ -326,7 +326,18 @@ def _coding_sections(content: str, targets: list[str]) -> dict[str, str]:
 _EDGE_DRIVER = """
 import ast, importlib, json, sys
 hints = []
-for module, function, cases in json.load(sys.stdin):
+inverse_cases, boundary_cases = json.load(sys.stdin)
+for module, forward, inverse, samples in inverse_cases:
+    target = importlib.import_module(module)
+    for sample in samples:
+        try:
+            encoded = getattr(target, forward)(sample)
+            result = getattr(target, inverse)(encoded)
+            if result != sample and isinstance(result, (str, bytes)):
+                hints.append(f"{inverse}({forward}({sample!r})) returned {result[:48]!r}, expected {sample!r}")
+        except Exception:
+            continue
+for module, function, cases in boundary_cases:
     fn = getattr(importlib.import_module(module), function)
     for args in cases:
         try:
@@ -364,14 +375,16 @@ async def _edge_observations(task: TaskSpec, sources: dict[str, str], tests: str
                             selected.append(args)
             if selected:
                 cases.append((module, node.name, selected[:3]))
-    if not cases:
+    modules = {".".join(Path(name).with_suffix("").parts) for name in sources}
+    inverse_cases = roundtrips.examples(tree, modules)
+    if not cases and not inverse_cases:
         return ""
     with tempfile.TemporaryDirectory(prefix="jiuwen-edge-") as temporary:
         root = _scratch_copy(task, Path(temporary))
         driver = Path(temporary) / "edges.py"
         driver.write_text(_EDGE_DRIVER, encoding="utf-8")
         observed = await _execute(run_python, driver, cwd=root, writable=False, timeout=1.5,
-                                  input_data=json.dumps(cases[:12]))
+                                  input_data=json.dumps([inverse_cases, cases[:12]]))
     if observed.passed:
         try:
             notes = json.loads(observed.output)
