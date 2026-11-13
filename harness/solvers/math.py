@@ -41,6 +41,7 @@ def solve(task: TaskSpec) -> SolveResult:
         rf"how many {items} does (?:it|the {site}) have at the end",
         rf"at the end, how many {items} does it have remaining",
         rf"how many {items} does it end up with",
+        rf"what is the number of {items} it has at the end",
         rf"how many {items} (?:are left|remain with it) at the end",
     )
     if not any(re.fullmatch(pattern, sentences[-1]) for pattern in questions):
@@ -56,6 +57,10 @@ def solve(task: TaskSpec) -> SolveResult:
         (rf"(?:after that, )?the shares are divided evenly into ([0-9]+) {sites}, "
          r"and a single share is kept \(rounded down\)", "split"),
         (rf"([0-9]+) {items} are shipped out", "subtract"),
+        (rf"([0-9]+) {items} are received by it", "add"),
+        (rf"it receives ([0-9]+) separate deliveries, each consisting of ([0-9]+) {items}", "add"),
+        (r"the number of items given away is half of its stock, rounded down", "half"),
+        (rf"of its stock, ([0-9]+)% is lost due to damage, with the number of damaged {items} rounded down", "loss"),
         (r"half of its stock is handed out, with the result rounded down", "half"),
         (rf"it (?:ships|dispatches) ([0-9]+) {items} each day (?:over a span of|for) ([0-9]+) days?", "subtract"),
         (rf"it (?:ships|dispatches) ([0-9]+) {items}(?: per day for ([0-9]+) days?)?", "subtract"),
