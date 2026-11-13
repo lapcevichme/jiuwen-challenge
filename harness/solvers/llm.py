@@ -1,4 +1,5 @@
 import ast
+import codecs
 import asyncio
 import contextvars
 import json
@@ -302,6 +303,22 @@ def _games_tests(original: str, patched: str) -> str | None:
     return f"fix adds {', '.join(added)}" if added else None
 
 
+_FILE_MARKER = re.compile(r"^#\s*file:\s*([^\r\n]+?)\s*$", re.MULTILINE | re.IGNORECASE)
+
+
+def _coding_sections(content: str, targets: list[str]) -> dict[str, str]:
+    if len(targets) == 1:
+        return {targets[0]: extract_code(content)}
+    code = re.sub(r"^```(?:python|py)?[ \t]*$", "", content, flags=re.MULTILINE)
+    parts = _FILE_MARKER.split(code)
+    sections = {}
+    for name, code in zip(parts[1::2], parts[2::2]):
+        if name not in targets or name in sections:
+            return {}
+        sections[name] = code.strip()
+    return sections
+
+
 def _failure_summary(output: str, limit: int = 1500) -> str:
     keep = [
         line for line in output.splitlines()
@@ -429,10 +446,11 @@ class LLMFallback:
         located = _locate(task, task.workspace)
         if isinstance(located, SolveResult):
             return located
-        script, target = located
-        target_path = resolve_inside(task.workspace, target)
+        script, targets = located
+        paths = {name: resolve_inside(task.workspace, name) for name in targets}
+        originals = {name: path.read_bytes() for name, path in paths.items()}
+        sources = {name: data.decode("utf-8-sig") for name, data in originals.items()}
         script_path = resolve_inside(task.workspace, script)
-        original = target_path.read_text(encoding="utf-8")
         tests = script_path.read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory(prefix="jiuwen-llm-") as scratch:
             root = _scratch_copy(task, Path(scratch))
@@ -440,46 +458,66 @@ class LLMFallback:
                                       timeout=SCRIPT_TIMEOUT)
             if baseline.passed:
                 return SolveResult.solved("DONE", "original tests already pass")
+            modules = "\n\n".join(f"Module {name}:\n{source}" for name, source in sources.items())
             prompt = (
-                f"Task:\n{question(task.instruction)}\n\nModule {target}:\n{original}\n\nTests {script}:\n{tests}\n\n"
+                f"Task:\n{question(task.instruction)}\n\n{modules}\n\nTests {script}:\n{tests}\n\n"
                 f"Failures:\n{_failure_summary(baseline.output)}"
             )
+            if len(targets) > 1:
+                prompt += ("\nGroup corrected definitions by module. Start each group with a line "
+                           "'# file: <exact filename>' followed by code. Omit unchanged modules.")
             prompt += self._feedback(task, feedback)
             reply = await self._chat(model, CODING_SYSTEM, prompt, max_tokens,
                                      max(1.0, timeout - 2 * SCRIPT_TIMEOUT), task.task_id)
-            self._previous_code[task.task_dir] = extract_code(reply.content)[:6000]
+            self._previous_code[task.task_dir] = reply.content[:6000]
             if reply.finish_reason == "length":
                 return SolveResult.unsupported(f"{model} repair truncated before completion")
-            patched = _splice(original, extract_code(reply.content))
-            if patched is None:
-                return SolveResult.unsupported(f"{model} reply has no usable definitions")
-            gaming = _games_tests(original, patched)
-            if gaming:
-                return SolveResult.unsupported(f"{model} {gaming}; rejected as test gaming")
-            resolve_inside(root, target).write_text(patched, encoding="utf-8")
+            sections = _coding_sections(reply.content, targets)
+            if not sections:
+                return SolveResult.unsupported("expected '# file: <exact filename>' for each changed module")
+            patches = {}
+            for name, code in sections.items():
+                patched = _splice(sources[name], code)
+                if patched is None:
+                    return SolveResult.unsupported(f"{model} supplied no usable definitions for {name}")
+                gaming = _games_tests(sources[name], patched)
+                if gaming:
+                    return SolveResult.unsupported(f"{model} {gaming}; rejected as test gaming")
+                encoding = "utf-8-sig" if originals[name].startswith(codecs.BOM_UTF8) else "utf-8"
+                patches[name] = patched.encode(encoding)
+                resolve_inside(root, name).write_bytes(patches[name])
             check = await _execute(run_python_tests, replace(task, workspace=root), script,
                                    timeout=SCRIPT_TIMEOUT)
             if not check.passed:
                 return SolveResult.unsupported(f"{model} fix fails tests: {_failure_summary(check.output, 300)}")
 
+        written = []
+
+        def restore():
+            for name in reversed(written):
+                _write_atomic(paths[name], originals[name])
+            written.clear()
+
         def commit():
             digest = _digest(script_path)
             accepted = False
             try:
-                _write_atomic(target_path, patched.encode("utf-8"))
+                for name, data in patches.items():
+                    _write_atomic(paths[name], data)
+                    written.append(name)
                 verified = run_python_tests(task, script, timeout=SCRIPT_TIMEOUT)
                 accepted = verified.passed and _digest(script_path) == digest
                 return accepted
             finally:
                 if not accepted:
-                    _write_atomic(target_path, original.encode("utf-8"))
+                    restore()
 
         operation = asyncio.create_task(asyncio.to_thread(commit))
         try:
             accepted = await asyncio.shield(operation)
         except asyncio.CancelledError:
             await operation
-            _write_atomic(target_path, original.encode("utf-8"))
+            restore()
             raise
         if not accepted:
             return SolveResult.unsupported(f"{model} fix did not verify in place; restored")

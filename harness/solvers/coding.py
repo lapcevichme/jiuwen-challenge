@@ -29,7 +29,11 @@ LOW_PLAUSIBILITY = 3
 WORKERS = max(1, min(4, os.cpu_count() or 1))
 
 _SCRIPT = re.compile(r"\bRun `(?:python3?\s+)?(?P<script>[\w./-]+\.py)`")
-_TARGET = re.compile(r"\bFix (?:the )?bugs? in `?(?P<target>[\w./-]+\.py)`?", re.IGNORECASE)
+_MODULE_NAME = r"[\w./-]+\.py"
+_TARGET = re.compile(
+    rf"\bFix (?:the )?bugs? in (?P<targets>`?{_MODULE_NAME}`?"
+    rf"(?:(?:,\s*(?:and\s+)?|\s+and\s+)`?{_MODULE_NAME}`?)*)", re.IGNORECASE,
+)
 _FAILURE = re.compile(r"^(?:FAIL|ERROR): (\S+) \(([^)\s]*)\)\s*$", re.MULTILINE)
 _RAN = re.compile(r"^Ran [0-9]+ tests? in ", re.MULTILINE)
 
@@ -628,29 +632,32 @@ def _best_pair(bench: _Bench, source: bytes, failures: Failures, edits: list[_Ed
     return None
 
 
-def _locate(task: TaskSpec, root: Path) -> tuple[str, str] | SolveResult:
+def _locate(task: TaskSpec, root: Path) -> tuple[str, list[str]] | SolveResult:
     script_match = _SCRIPT.search(task.instruction)
     target_match = _TARGET.search(task.instruction)
     script = script_match["script"] if script_match else None
-    target = target_match["target"] if target_match else None
+    targets = re.findall(_MODULE_NAME, target_match["targets"]) if target_match else []
     if script is None:
         tests = sorted(path.name for path in root.glob("test_*.py"))
         if len(tests) != 1:
             return SolveResult.unsupported("cannot identify the test script")
         script = tests[0]
-    if target is None:
+    if not targets:
         modules = sorted(
             path.name for path in root.glob("*.py") if path.name != script and not path.name.startswith("test_")
         )
         if len(modules) != 1:
             return SolveResult.unsupported("cannot identify the module to fix")
-        target = modules[0]
-    for name in (script, target):
+        targets = modules
+    for name in [script, *targets]:
         if not resolve_inside(root, name).is_file():
             return SolveResult.unsolvable(f"{name!r} named by the task does not exist")
-    if resolve_inside(root, script) == resolve_inside(root, target):
-        return SolveResult.unsupported("the module to fix is the test script")
-    return script, target
+    paths = {resolve_inside(root, name) for name in targets}
+    if len(paths) != len(targets) or any(root / name != resolve_inside(root, name) for name in targets):
+        return SolveResult.unsupported("module list contains an alias")
+    if resolve_inside(root, script) in paths or any(p.name.startswith("test_") or p.stem.endswith("_test") for p in paths):
+        return SolveResult.unsupported("the module to fix is a test script")
+    return script, targets
 
 
 def _contradiction(test_source: bytes, module_source: bytes, module: str) -> str | None:
@@ -706,14 +713,15 @@ def precheck(task: TaskSpec) -> SolveResult:
         located = _locate(task, task.workspace)
         if isinstance(located, SolveResult):
             return located
-        script, target = located
+        script, targets = located
         test_source = resolve_inside(task.workspace, script).read_bytes()
-        module_source = resolve_inside(task.workspace, target).read_bytes()
+        for target in targets:
+            source = resolve_inside(task.workspace, target).read_bytes()
+            contradiction = _contradiction(test_source, source, ".".join(Path(target).with_suffix("").parts))
+            if contradiction:
+                return SolveResult.unsolvable(f"the tests contradict each other: {contradiction}")
     except (OSError, ValueError) as error:
         return SolveResult.error(f"cannot prepare coding task: {error}")
-    contradiction = _contradiction(test_source, module_source, ".".join(Path(target).with_suffix("").parts))
-    if contradiction:
-        return SolveResult.unsolvable(f"the tests contradict each other: {contradiction}")
     with tempfile.TemporaryDirectory(prefix="jiuwen-precheck-") as scratch:
         root = Path(scratch) / "workspace"
         shutil.copytree(task.workspace, root, symlinks=True)
@@ -731,7 +739,8 @@ def solve(task: TaskSpec) -> SolveResult:
         located = _locate(task, task.workspace)
         if isinstance(located, SolveResult):
             return located
-        script, target = located
+        script, targets = located
+        target = targets[0]
         target_path = resolve_inside(task.workspace, target)
         script_path = resolve_inside(task.workspace, script)
         original = target_path.read_bytes()
