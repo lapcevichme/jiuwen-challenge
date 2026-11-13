@@ -1,7 +1,7 @@
 import ast
 import codecs
 
-from harness.solvers import calendar_repairs, roman_repairs, run_length, units_repairs
+from harness.solvers import calendar_repairs, roman_repairs, run_length, stock_cleanup, units_repairs
 
 
 def _shape(node):
@@ -102,6 +102,10 @@ def candidate(original: bytes, tests: bytes, module: str) -> bytes | None:
         "format_duration", "humanize_duration"
     } for fn in tree.body):
         ranges.extend(calendar_repairs.edits(tree, tests, source))
+    if b"del " in body and b"-=" in body:
+        for cls in tree.body:
+            if isinstance(cls, ast.ClassDef) and cls.name.encode() in tests:
+                ranges.extend(stock_cleanup.edits(cls))
     if b"fahrenheit_to_celsius" in body:
         ranges.extend(units_repairs.edits(tree, tests))
     if b".isdigit()" in body and b"assertEqual" in tests:
