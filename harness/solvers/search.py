@@ -35,6 +35,11 @@ _QUERIES = [
     (_CITY + r"(.+)", ("headquarters",)),
     (_YEAR + r"(.+) founded", ("founded",)),
 ]
+_COUNT = (
+    (r"How many people in the knowledge base work for (.+)", ("staff",)),
+    (r"(?:Report|Find) the number of people in the knowledge base who work for (.+)", ("staff",)),
+    (r"(?:Report|Find) the number of people in the knowledge base on (.+)['’]s staff", ("staff",)),
+)
 _HEADING = re.compile(r"#\s+(.+)")
 _FIELD = re.compile(r"([\w][\w -]*):\s*(\S.*)")
 _ATTRIBUTES = {"born", "mentor", "employer", "headquarters", "founded", "industry", "role"}
@@ -49,13 +54,15 @@ def _normalize(text: str) -> str:
     return " ".join(text.casefold().split())
 
 
-def _read_index(kb: Path) -> dict[tuple[str, str], dict[str, str]]:
+def _read_index(kb: Path, *, complete: bool = False) -> dict[tuple[str, str], dict[str, str]]:
     index: dict[tuple[str, str], dict[str, str]] = {}
     for entry in sorted(kb.iterdir()):
         path = resolve_inside(kb, entry.name)
         if path.is_dir():
             raise ValueError(f"nested knowledge base directory {entry.name!r}")
         if entry.suffix.lower() not in (".md", ".markdown"):
+            if complete:
+                raise ValueError("unrecognized file in the employee directory")
             continue
         if not path.is_file():
             raise OSError(f"unreadable Markdown entry {entry.name!r}")
@@ -63,6 +70,8 @@ def _read_index(kb: Path) -> dict[tuple[str, str], dict[str, str]]:
         heading = _HEADING.fullmatch(lines[0]) if lines else None
         if heading is None:
             raise ValueError(f"unknown Markdown heading format in {entry.name!r}")
+        if complete and len(lines) == 1:
+            raise ValueError("cannot classify an empty profile")
         entity = _normalize(heading[1])
         for line in lines[1:]:
             field = _FIELD.fullmatch(line)
@@ -76,8 +85,29 @@ def _read_index(kb: Path) -> dict[tuple[str, str], dict[str, str]]:
     return index
 
 
+def _staff_count(index, company: str) -> SolveResult:
+    profiles = {}
+    for (name, attribute), values in index.items():
+        profiles.setdefault(name, {})[attribute] = values
+    target = _normalize(company)
+    company_fields = {"headquarters", "founded", "industry"}
+    if not company_fields.intersection(profiles.get(target, {})):
+        return SolveResult.unsupported("target has no company profile")
+    count = 0
+    for fields in profiles.values():
+        if company_fields.intersection(fields):
+            if fields.keys() <= company_fields:
+                continue
+            return SolveResult.unsupported("ambiguous person/company profile")
+        employers = {_normalize(value) for value in fields.get("employer", {})}
+        if len(employers) != 1:
+            return SolveResult.unsupported("incomplete or conflicting employer fields")
+        count += target in employers
+    return SolveResult.solved(str(count), f"{count} distinct profiles employed by {company!r}")
+
+
 def solve(task: TaskSpec) -> SolveResult:
-    question = question_text(task.instruction)
+    question = question_text(task.instruction, allow_statement=True)
     directory = "kb"
     intro = None
     for description in _INTROS:
@@ -86,7 +116,7 @@ def solve(task: TaskSpec) -> SolveResult:
             directory = intro["kb"]
             question = question[intro.end():]
             break
-    for pattern, attributes in _QUERIES:
+    for pattern, attributes in (*_QUERIES, *_COUNT):
         match = re.fullmatch(pattern, question, re.IGNORECASE)
         if match:
             entity = match[1].strip()
@@ -104,12 +134,14 @@ def solve(task: TaskSpec) -> SolveResult:
             if intro:
                 return SolveResult.unsolvable(f"knowledge base {directory!r} is missing")
             return SolveResult.unsupported("no knowledge base at the default path")
-        index = _read_index(kb)
+        index = _read_index(kb, complete=attributes == ("staff",))
     except (OSError, UnicodeError) as error:
         return SolveResult.error(f"cannot read knowledge base: {error}")
     except ValueError as error:
         return SolveResult.unsupported(str(error))
 
+    if attributes == ("staff",):
+        return _staff_count(index, entity)
     known = {name for name, _ in index}
     evidence = []
     for hop, attribute in enumerate(attributes):
