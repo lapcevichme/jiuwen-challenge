@@ -10,7 +10,6 @@ from pathlib import Path
 
 from harness.contracts import Solver, TaskSpec
 from harness.config import number
-from harness.scheduler import run_tasks
 from harness.task_io import load_task, resolve_inside
 
 LOG = logging.getLogger("harness")
@@ -94,7 +93,10 @@ def build_fallback():
         LOG.warning("unapproved LLM model override; using competition defaults")
         models = Models()
     trust = os.environ.get("LLM_TRUST_FAST_UNSOLVABLE", "1") != "0"
-    return LLMFallback(LLMClient(base_url, api_key, ledger), models, trust_fast_unsolvable=trust,
+    from harness.agent import JiuwenChat
+
+    chat = JiuwenChat(LLMClient(base_url, api_key, ledger), default_model=models.fast)
+    return LLMFallback(chat, models, trust_fast_unsolvable=trust,
                        adaptive_output=os.environ.get("LLM_ADAPTIVE_OUTPUT", "1") != "0"), ledger
 
 
@@ -109,18 +111,18 @@ def build_limits() -> "ScheduleLimits":
 
 
 async def _run(root: Path, deadline: float) -> None:
-    from harness.workflow import SolverWorkflow
-
+    from harness.agent import ContestAgent
     from harness.runtime import sandbox_status
+    from harness.workflow import SolverWorkflow
 
     LOG.info("task sandbox: %s", sandbox_status())
     workflow = SolverWorkflow(build_registry())
     rescue = build_last_resort()
     last_resort = SolverWorkflow(rescue).solve if rescue else None
     fallback, ledger = build_fallback()
+    agent = ContestAgent(workflow.solve, fallback=fallback, last_resort=last_resort, limits=build_limits())
     try:
-        await run_tasks(_tasks(root), workflow.solve, deadline=deadline, fallback=fallback,
-                        last_resort=last_resort, limits=build_limits())
+        await agent.invoke({"tasks": _tasks(root), "deadline": deadline})
     finally:
         if ledger is not None:
             LOG.info("%s", ledger.summary())
