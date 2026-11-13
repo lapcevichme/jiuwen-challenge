@@ -8,22 +8,28 @@ from harness.task_io import resolve_inside
 _DIRECTORY = r"directory `?(?P<kb>[\w./-]+)`?"
 _BASE = r"a (?:small )?knowledge base"
 _INTROS = [
-    rf"the {_DIRECTORY} (?:contains|holds|is home to) {_BASE} (?:of|made up of|composed of) markdown files",
+    rf"the {_DIRECTORY} (?:contains|holds|houses|is home to) {_BASE} (?:of|made up of|composed of|that consists of) markdown files",
     rf"within the {_DIRECTORY}, you will find {_BASE} of markdown files",
     rf"you can find {_BASE} of markdown files in the {_DIRECTORY}",
     rf"{_BASE}, composed of markdown files, is located in the {_DIRECTORY}",
+    rf"{_BASE} of markdown files (?:resides|is located) in the {_DIRECTORY}",
 ]
-_YEAR = r"In (?:which|what) year was "
+_YEAR = r"(?:In (?:which|what) year|What year) was "
 _CITY = r"(?:In which city (?:is|can you find)|What city is home to) the headquarters of "
 _QUERIES = [
     (_YEAR + r"(.+)['’]s mentor born", ("mentor", "born")),
     (_YEAR + r"the mentor of (.+) born", ("mentor", "born")),
-    (_YEAR + r"(.+)['’]s employer founded", ("employer", "founded")),
+    (_YEAR + r"(.+)['’]s employer (?:founded|established)", ("employer", "founded")),
+    (r"What is the founding year of the company (?:that )?(.+) works for", ("employer", "founded")),
     (_YEAR + r"(.+) born", ("born",)),
     (r"(?:Can you tell me )?the year of birth of (.+)", ("born",)),
     (r"Who is (.+)['’]s mentor", ("mentor",)),
     (r"(?:Who|What) is (.+)['’]s employer", ("employer",)),
     (r"Which company does (.+) work for", ("employer",)),
+    (r"Where does (.+) work as an employee", ("employer",)),
+    (r"Who guides (.+) as a mentor", ("mentor",)),
+    (r"In (?:which|what) city does the employer of (.+) have its headquarters", ("employer", "headquarters")),
+    (r"In (?:which|what) city does (.+) (?:have|maintain) its headquarters", ("headquarters",)),
     (_CITY + r"the company that employs (.+)['’]s mentor", ("mentor", "employer", "headquarters")),
     (_CITY + r"(.+)['’]s employer", ("employer", "headquarters")),
     (_CITY + r"(.+)", ("headquarters",)),
