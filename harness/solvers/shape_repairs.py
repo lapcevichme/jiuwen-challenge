@@ -1,7 +1,7 @@
 import ast
 import codecs
 
-from harness.solvers import calendar_repairs, roman_repairs, run_length
+from harness.solvers import calendar_repairs, roman_repairs, run_length, units_repairs
 
 
 def _shape(node):
@@ -102,6 +102,8 @@ def candidate(original: bytes, tests: bytes, module: str) -> bytes | None:
         "format_duration", "humanize_duration"
     } for fn in tree.body):
         ranges.extend(calendar_repairs.edits(tree, tests, source))
+    if b"fahrenheit_to_celsius" in body:
+        ranges.extend(units_repairs.edits(tree, tests))
     if b".isdigit()" in body and b"assertEqual" in tests:
         try:
             ranges.extend(run_length.edits(tree, ast.parse(tests), module))
