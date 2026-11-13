@@ -17,6 +17,7 @@ from queue import SimpleQueue
 
 from harness.contracts import SolveResult, TaskSpec
 from harness.runtime import TestResult, run_python, run_python_tests
+from harness.solvers.defaults import isolated_defaults
 from harness.task_io import resolve_inside
 
 TIME_LIMIT = 60.0
@@ -730,6 +731,30 @@ def precheck(task: TaskSpec) -> SolveResult:
         root = Path(scratch) / "workspace"
         shutil.copytree(task.workspace, root, symlinks=True)
         result = run_python_tests(replace(task, workspace=root), script, timeout=PRECHECK_TIMEOUT)
+        if not result.passed and not result.timed_out:
+            patches = {}
+            for target in targets:
+                path = resolve_inside(task.workspace, target)
+                original = path.read_bytes()
+                candidate = isolated_defaults(original)
+                if candidate is not None:
+                    (root / target).write_bytes(candidate)
+                    patches[path] = (original, candidate)
+            if patches and run_python_tests(replace(task, workspace=root), script, timeout=PRECHECK_TIMEOUT).passed:
+                accepted = False
+                written = []
+                try:
+                    for path, (original, candidate) in patches.items():
+                        _write_atomic(path, candidate)
+                        written.append((path, original))
+                    check = run_python_tests(task, script, timeout=PRECHECK_TIMEOUT)
+                    accepted = check.passed and resolve_inside(task.workspace, script).read_bytes() == test_source
+                    if accepted:
+                        return SolveResult.solved("DONE", "isolated mutable defaults; original tests pass in place")
+                finally:
+                    if not accepted:
+                        for path, original in reversed(written):
+                            _write_atomic(path, original)
     if result.passed:
         return SolveResult.solved("DONE", "original tests already pass")
     return SolveResult.unsupported("precheck timed out; needs longer verification or repair" if result.timed_out
