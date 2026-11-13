@@ -7,6 +7,7 @@ from harness.solvers._instruction import question_text
 _INITIAL = (
     r"(?:a|an) (?P<site>[a-z]+) (?:starts with|begins with|initially has|is initially stocked with) "
     r"(?P<count>[0-9]+) (?P<items>[a-z]+)",
+    r"the starting quantity of (?P<items>[a-z]+) in (?:a|an) (?P<site>[a-z]+) is (?P<count>[0-9]+)",
     r"at the (?:beginning|start), there are (?P<count>[0-9]+) (?P<items>[a-z]+) at (?:a|an) (?P<site>[a-z]+)",
 )
 
@@ -39,6 +40,7 @@ def solve(task: TaskSpec) -> SolveResult:
     questions = (
         rf"how many {items} does (?:it|the {site}) have at the end",
         rf"at the end, how many {items} does it have remaining",
+        rf"how many {items} does it end up with",
         rf"how many {items} (?:are left|remain with it) at the end",
     )
     if not any(re.fullmatch(pattern, sentences[-1]) for pattern in questions):
@@ -51,9 +53,13 @@ def solve(task: TaskSpec) -> SolveResult:
         (rf"the stock is split equally into ([0-9]+) {sites} and it keeps one share \(rounded down\)", "split"),
         (rf"the stock is (?:subsequently |then )?divided evenly (?:across|among) ([0-9]+) {sites}, "
          r"(?:with one share (?:held back|retained)|and one share is kept) \(rounded down\)", "split"),
+        (rf"(?:after that, )?the shares are divided evenly into ([0-9]+) {sites}, "
+         r"and a single share is kept \(rounded down\)", "split"),
+        (rf"([0-9]+) {items} are shipped out", "subtract"),
+        (r"half of its stock is handed out, with the result rounded down", "half"),
         (rf"it (?:ships|dispatches) ([0-9]+) {items} each day (?:over a span of|for) ([0-9]+) days?", "subtract"),
         (rf"it (?:ships|dispatches) ([0-9]+) {items}(?: per day for ([0-9]+) days?)?", "subtract"),
-        (rf"it (?:receives|acquires) ([0-9]+) {items}(?: per day for ([0-9]+) days?)?", "add"),
+        (rf"it (?:receives|acquires|obtains) ([0-9]+) {items}(?: per day for ([0-9]+) days?)?", "add"),
         (rf"it receives ([0-9]+) deliver(?:y|ies) of ([0-9]+) {items} each", "add"),
         (rf"it is sent ([0-9]+) deliveries, each of which contains ([0-9]+) {items}", "add"),
         (r"half of its stock is given away, with the number given away rounded down", "half"),
