@@ -19,7 +19,7 @@ from harness.contracts import SolveResult, TaskSpec
 from harness.llm_client import LLMClient, LLMError, LLMUnavailable
 from harness.runtime import run_python, run_python_tests
 from harness.scheduler import FallbackRetryLater, FallbackUnavailable
-from harness.solvers import class_patches, math_checks, roundtrips, search_evidence
+from harness.solvers import class_patches, math_checks, numeric_examples, roundtrips, search_evidence
 from harness.solvers.coding import _digest, _literal_calls, _locate, _write_atomic
 from harness.task_io import resolve_inside
 
@@ -339,7 +339,17 @@ def _coding_sections(content: str, targets: list[str]) -> dict[str, str]:
 _EDGE_DRIVER = """
 import ast, importlib, json, sys
 hints = []
-inverse_cases, boundary_cases = json.load(sys.stdin)
+inverse_cases, boundary_cases, comparisons = json.load(sys.stdin)
+for module, name, samples in comparisons:
+    fn = getattr(importlib.import_module(module), name)
+    for arguments, reference in samples:
+        try:
+            actual = fn(*ast.literal_eval(arguments))
+            if type(actual) in (int, bool, float) and actual != reference:
+                hints.append(f"{module}.{name}{arguments} returned {actual!r}; standard {name}: {reference!r}")
+                break
+        except Exception:
+            continue
 for module, forward, inverse, samples in inverse_cases:
     target = importlib.import_module(module)
     for sample in samples:
@@ -390,14 +400,15 @@ async def _edge_observations(task: TaskSpec, sources: dict[str, str], tests: str
                 cases.append((module, node.name, selected[:3]))
     modules = {".".join(Path(name).with_suffix("").parts) for name in sources}
     inverse_cases = roundtrips.examples(tree, modules)
-    if not cases and not inverse_cases:
+    comparisons = numeric_examples.examples(tree, modules)
+    if not cases and not inverse_cases and not comparisons:
         return ""
     with tempfile.TemporaryDirectory(prefix="jiuwen-edge-") as temporary:
         root = _scratch_copy(task, Path(temporary))
         driver = Path(temporary) / "edges.py"
         driver.write_text(_EDGE_DRIVER, encoding="utf-8")
         observed = await _execute(run_python, driver, cwd=root, writable=False, timeout=1.5,
-                                  input_data=json.dumps([inverse_cases, cases[:12]]))
+                                  input_data=json.dumps([inverse_cases, cases[:12], comparisons]))
     if observed.passed:
         try:
             notes = json.loads(observed.output)
@@ -582,10 +593,12 @@ class LLMFallback:
             if len(targets) > 1:
                 prompt += ("\nGroup corrected definitions by module. Start each group with a line "
                            "'# file: <exact filename>' followed by code. Omit unchanged modules.")
-            if any(re.search(r"^class\s+\w+", source, re.MULTILINE) for source in sources.values()):
-                prompt += ("\nFor existing classes return only changed methods in a 'class Name:' wrapper. "
-                           "Keep public signatures and optional arguments. Check state across repeated calls and "
-                           "independent instances. Keep unchanged methods out of the response.")
+            if re.search(r"half[_ -]up", tests + modules, re.I):
+                prompt += ("\nCheck the named rounding rule on both signs and exact decimal ties. "
+                           "Python round and int(x + 0.5) have different tie semantics from decimal ROUND_HALF_UP.")
+            if re.search(r"^def (?:to_|encode)", modules, re.M) and re.search(r"^def (?:from_|decode)", modules, re.M):
+                prompt += ("\nCheck that encoding followed by decoding recovers each supported input. "
+                           "Inspect all entries in any lookup tables used by the two directions.")
             prompt += await _edge_observations(task, sources, tests)
             prompt += self._feedback(task, feedback)
             reply = await self._chat(model, CODING_SYSTEM, prompt, max_tokens,
