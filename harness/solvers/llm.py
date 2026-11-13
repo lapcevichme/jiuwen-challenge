@@ -19,7 +19,7 @@ from harness.contracts import SolveResult, TaskSpec
 from harness.llm_client import LLMClient, LLMError, LLMUnavailable
 from harness.runtime import run_python, run_python_tests
 from harness.scheduler import FallbackRetryLater, FallbackUnavailable
-from harness.solvers import class_patches, roundtrips, search_evidence
+from harness.solvers import class_patches, math_checks, roundtrips, search_evidence
 from harness.solvers.coding import _digest, _literal_calls, _locate, _write_atomic
 from harness.task_io import resolve_inside
 
@@ -524,7 +524,8 @@ class LLMFallback:
         if reply.finish_reason == "length":
             return SolveResult.unsupported(f"{model} output truncated before completion")
         if reply.content.strip().strip("`").strip().upper().rstrip(".") == "UNSOLVABLE":
-            if final or (self.trust_fast_unsolvable and task.task_type == "math" and task.workspace is None):
+            if final or (self.trust_fast_unsolvable and task.task_type == "math" and task.workspace is None
+                         and math_checks.vague_quantity(question(task.instruction))):
                 return SolveResult.unsolvable(f"{model} finds information missing for an exact answer")
             return SolveResult.unsupported(f"{model} replied UNSOLVABLE")
         if task.task_type == "search" and task.check == "exact_str":
@@ -550,6 +551,10 @@ class LLMFallback:
         answer = normalize_answer(result.output, task.check)
         if answer is None:
             return SolveResult.unsupported(f"{model} script output is not a valid answer: {result.output[-200:]!r}")
+        if task.task_type == "math" and not final:
+            reason = math_checks.unused_quantity(code, question(task.instruction))
+            if reason:
+                return SolveResult.unsupported(reason)
         return SolveResult.solved(answer, f"{model} script, cost {reply.cost:.1f} tokens")
 
     async def _coding(self, task, model, max_tokens, timeout, feedback) -> SolveResult:
