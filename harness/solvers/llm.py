@@ -19,7 +19,7 @@ from harness.contracts import SolveResult, TaskSpec
 from harness.llm_client import LLMClient, LLMError, LLMUnavailable
 from harness.runtime import run_python, run_python_tests
 from harness.scheduler import FallbackRetryLater, FallbackUnavailable
-from harness.solvers import class_patches, csv_query, math_checks, numeric_examples, roundtrips, search_evidence
+from harness.solvers import class_patches, csv_query, line_edits, math_checks, numeric_examples, roundtrips, search_evidence
 from harness.solvers.coding import _digest, _literal_calls, _locate, _write_atomic
 from harness.task_io import resolve_inside
 
@@ -76,9 +76,12 @@ CODING_SYSTEM = (
     "contract from the task, name, docstring and tests. Mentally try boundary values, repeated values, missing "
     "items and empty inputs. Fix independent logic errors wherever the implementation contradicts the contract. "
     "Preserve existing behavior where the contract is ambiguous. Preserve the API; do not "
-    "hardcode test inputs or change tests. Output only complete corrected top-level definitions and any "
-    "necessary imports or module constants as Python code. Keep unchanged definitions out of the reply."
+    "hardcode test inputs or change tests."
 )
+
+
+DEFINITION_FORMAT = ("Output only complete corrected top-level definitions and any necessary imports or module "
+                     "constants as Python code. Keep unchanged definitions out of the reply.")
 
 
 STOCK_SYSTEM = (
@@ -523,7 +526,11 @@ class LLMFallback:
             chars = len(prompt) + source_bytes
             system = CODING_SYSTEM
             if attempt == 1:
-                output = max(55, min(450, implementation_bytes / 4))
+                if implementation_bytes >= line_edits.MIN_SOURCE_BYTES:
+                    system += line_edits.FORMAT
+                    output = min(145, 55 + implementation_bytes / 22)
+                else:
+                    output = max(55, implementation_bytes / 4)
         elif attempt == 1 and (evidence := self._search_evidence(task)) is not None:
             chars = len(prompt) + len(evidence.prompt)
             system = search_evidence.LOOKUP_SYSTEM if evidence.focused else search_evidence.SYSTEM
@@ -690,12 +697,15 @@ class LLMFallback:
                                       timeout=SCRIPT_TIMEOUT)
             if baseline.passed:
                 return SolveResult.solved("DONE", "original tests already pass")
-            modules = "\n\n".join(f"Module {name}:\n{source}" for name, source in sources.items())
+            compact = (not feedback and sum(len(data) for data in originals.values()) >= line_edits.MIN_SOURCE_BYTES)
+            system = CODING_SYSTEM + " " + (line_edits.FORMAT if compact else DEFINITION_FORMAT)
+            modules = "\n\n".join(f"Module {name}:\n{line_edits.numbered(source) if compact else source}"
+                                  for name, source in sources.items())
             prompt = (
                 f"Task:\n{question(task.instruction)}\n\n{modules}\n\nTests {script}:\n{tests}\n\n"
                 f"Failures:\n{_failure_summary(baseline.output)}"
             )
-            if len(targets) > 1:
+            if len(targets) > 1 and not compact:
                 prompt += ("\nGroup corrected definitions by module. Start each group with a line "
                            "'# file: <exact filename>' followed by code. Omit unchanged modules.")
             if re.search(r"half[_ -]up", tests + modules, re.I):
@@ -708,7 +718,7 @@ class LLMFallback:
             prompt += self._feedback(task, feedback)
             generation_timeout = max(1.0, timeout - 2 * SCRIPT_TIMEOUT)
             try:
-                reply = await self._chat(model, CODING_SYSTEM, prompt, max_tokens, generation_timeout, task.task_id)
+                reply = await self._chat(model, system, prompt, max_tokens, generation_timeout, task.task_id)
             except BudgetExhausted as error:
                 if (error.temporary or not self.adaptive_output or model == self.models.fast
                         or not self.models.fast.endswith("-noreason") or " fix fails tests:" not in feedback
@@ -717,19 +727,26 @@ class LLMFallback:
                     raise
                 model = self.models.fast
                 _EVENT.get()["model"] = model
-                reply = await self._chat(model, CODING_SYSTEM, prompt, self.models.fast_max_tokens,
+                reply = await self._chat(model, system, prompt, self.models.fast_max_tokens,
                                          generation_timeout, task.task_id)
             self._previous_code[task.task_dir] = reply.content[:6000]
             if reply.finish_reason == "length":
                 return SolveResult.unsupported(f"{model} repair truncated before completion")
-            sections = _coding_sections(reply.content, targets)
-            if not sections:
-                return SolveResult.unsupported("expected '# file: <exact filename>' for each changed module")
+            replacements = line_edits.apply(reply.content, sources) if compact else None
+            if replacements is None:
+                if compact and any(line.startswith("@@") for line in reply.content.splitlines()):
+                    return SolveResult.unsupported("invalid numbered replacement; repair using complete definitions")
+                sections = _coding_sections(reply.content, targets)
+                if not sections:
+                    return SolveResult.unsupported("expected '# file: <exact filename>' for each changed module")
+                replacements = {}
+                for name, code in sections.items():
+                    patched = _splice(sources[name], code)
+                    if patched is None:
+                        return SolveResult.unsupported(f"{model} supplied no usable definitions for {name}")
+                    replacements[name] = patched
             patches = {}
-            for name, code in sections.items():
-                patched = _splice(sources[name], code)
-                if patched is None:
-                    return SolveResult.unsupported(f"{model} supplied no usable definitions for {name}")
+            for name, patched in replacements.items():
                 gaming = _games_tests(sources[name], patched)
                 if gaming:
                     return SolveResult.unsupported(f"{model} {gaming}; rejected as test gaming")
