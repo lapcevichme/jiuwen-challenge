@@ -79,14 +79,17 @@ def isolated_defaults(source: bytes) -> bytes | None:
 
 
 def _can_share_state(function, name: str) -> bool:
+    mutated = returned = False
     for node in ast.walk(function):
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Name) and node.value.id == name:
+            returned = True
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == name:
             if node.attr in {"append", "extend", "insert", "pop", "remove", "clear", "update", "setdefault", "sort", "reverse"}:
-                return True
+                mutated = True
         if isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
             if isinstance(node.value, ast.Name) and node.value.id == name:
-                return True
+                mutated = True
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id == name:
             if any(isinstance(t, ast.Attribute) for t in node.targets):
                 return True
-    return False
+    return mutated and returned
