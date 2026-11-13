@@ -706,8 +706,19 @@ class LLMFallback:
                            "Inspect all entries in any lookup tables used by the two directions.")
             prompt += await _edge_observations(task, sources, tests)
             prompt += self._feedback(task, feedback)
-            reply = await self._chat(model, CODING_SYSTEM, prompt, max_tokens,
-                                     max(1.0, timeout - 2 * SCRIPT_TIMEOUT), task.task_id)
+            generation_timeout = max(1.0, timeout - 2 * SCRIPT_TIMEOUT)
+            try:
+                reply = await self._chat(model, CODING_SYSTEM, prompt, max_tokens, generation_timeout, task.task_id)
+            except BudgetExhausted as error:
+                if (error.temporary or not self.adaptive_output or model == self.models.fast
+                        or not self.models.fast.endswith("-noreason") or " fix fails tests:" not in feedback
+                        or len(targets) != 1 or len(sources[targets[0]]) > 1000
+                        or not 0 < len(self._previous_code.get(task.task_dir, "")) <= 1200):
+                    raise
+                model = self.models.fast
+                _EVENT.get()["model"] = model
+                reply = await self._chat(model, CODING_SYSTEM, prompt, self.models.fast_max_tokens,
+                                         generation_timeout, task.task_id)
             self._previous_code[task.task_dir] = reply.content[:6000]
             if reply.finish_reason == "length":
                 return SolveResult.unsupported(f"{model} repair truncated before completion")
