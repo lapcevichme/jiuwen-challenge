@@ -540,11 +540,7 @@ def _alternatives(value) -> list:
     return []
 
 
-def _probes(test_source: bytes, module: str, function: str) -> list[str]:
-    try:
-        tree = ast.parse(test_source)
-    except SyntaxError:
-        return []
+def _literal_calls(tree: ast.Module, module: str, function: str) -> list[tuple]:
     aliases = {alias.asname or alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
                for alias in node.names if alias.name == module}
     direct = {alias.asname or alias.name for node in ast.walk(tree)
@@ -561,8 +557,16 @@ def _probes(test_source: bytes, module: str, function: str) -> list[str]:
                 seeds.append(tuple(ast.literal_eval(arg) for arg in node.args))
             except (ValueError, SyntaxError, TypeError):
                 continue
+    return seeds
+
+
+def _probes(test_source: bytes, module: str, function: str) -> list[str]:
+    try:
+        tree = ast.parse(test_source)
+    except SyntaxError:
+        return []
     probes: list[str] = []
-    for seed in seeds:
+    for seed in _literal_calls(tree, module, function):
         for index, value in enumerate(seed):
             for alternative in _alternatives(value):
                 text = repr(seed[:index] + (alternative,) + seed[index + 1:])

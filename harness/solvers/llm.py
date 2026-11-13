@@ -18,7 +18,7 @@ from harness.contracts import SolveResult, TaskSpec
 from harness.llm_client import LLMClient, LLMError, LLMUnavailable
 from harness.runtime import run_python, run_python_tests
 from harness.scheduler import FallbackRetryLater, FallbackUnavailable
-from harness.solvers.coding import _digest, _locate, _write_atomic
+from harness.solvers.coding import _digest, _literal_calls, _locate, _write_atomic
 from harness.task_io import resolve_inside
 
 TRAJECTORY_ENV = "HARNESS_TRAJECTORIES"
@@ -322,6 +322,66 @@ def _coding_sections(content: str, targets: list[str]) -> dict[str, str]:
     return sections
 
 
+_EDGE_DRIVER = """
+import ast, importlib, json, sys
+hints = []
+for module, function, cases in json.load(sys.stdin):
+    fn = getattr(importlib.import_module(module), function)
+    for args in cases:
+        try:
+            fn(*ast.literal_eval(args))
+        except (IndexError, KeyError) as error:
+            hints.append(f"{module}.{function}{args} raised {type(error).__name__}")
+            break
+        except Exception:
+            continue
+print(json.dumps(hints))
+"""
+
+
+async def _edge_observations(task: TaskSpec, sources: dict[str, str], tests: str) -> str:
+    try:
+        tree = ast.parse(tests)
+    except SyntaxError:
+        return ""
+    cases = []
+    for name, source in sources.items():
+        module = ".".join(Path(name).with_suffix("").parts)
+        try:
+            definitions = ast.parse(source).body
+        except SyntaxError:
+            continue
+        for node in definitions:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            selected = []
+            for seed in _literal_calls(tree, module, node.name):
+                for index, value in enumerate(seed):
+                    if isinstance(value, (list, tuple)) and len(value) > 1:
+                        args = repr(seed[:index] + (value[:1],) + seed[index + 1:])
+                        if len(args) <= 200 and args not in selected:
+                            selected.append(args)
+            if selected:
+                cases.append((module, node.name, selected[:3]))
+    if not cases:
+        return ""
+    with tempfile.TemporaryDirectory(prefix="jiuwen-edge-") as temporary:
+        root = _scratch_copy(task, Path(temporary))
+        driver = Path(temporary) / "edges.py"
+        driver.write_text(_EDGE_DRIVER, encoding="utf-8")
+        observed = await _execute(run_python, driver, cwd=root, writable=False, timeout=1.5,
+                                  input_data=json.dumps(cases[:12]))
+    if observed.passed:
+        try:
+            notes = json.loads(observed.output)
+        except ValueError:
+            return ""
+        if isinstance(notes, list) and notes and all(isinstance(note, str) for note in notes):
+            return ("\nObserved on nearby inputs (check whether these are within the function contract):\n"
+                    + "\n".join(notes)[:900])
+    return ""
+
+
 def _failure_summary(output: str, limit: int = 1500) -> str:
     keep = [
         line for line in output.splitlines()
@@ -469,6 +529,7 @@ class LLMFallback:
             if len(targets) > 1:
                 prompt += ("\nGroup corrected definitions by module. Start each group with a line "
                            "'# file: <exact filename>' followed by code. Omit unchanged modules.")
+            prompt += await _edge_observations(task, sources, tests)
             prompt += self._feedback(task, feedback)
             reply = await self._chat(model, CODING_SYSTEM, prompt, max_tokens,
                                      max(1.0, timeout - 2 * SCRIPT_TIMEOUT), task.task_id)
