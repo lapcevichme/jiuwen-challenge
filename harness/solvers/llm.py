@@ -66,6 +66,10 @@ SCRIPT_SYSTEM = (
 MATH_SYSTEM = SCRIPT_SYSTEM + (
     " For inverse problems, verify the candidate by substituting it back into the original conditions."
 )
+NOTES_SYSTEM = """Write a short Python calculation, using the facts shown in the question and the complete file
+contents below. Use their literal values directly. Preserve units, the order of events and the requested rounding.
+Check which quantity is being asked for, including its initial conditions. Print only the computed result.
+Return only code, without a file parser or explanation. If a required fact is absent, reply only UNSOLVABLE."""
 CODING_SYSTEM = (
     "Fix the module according to the task and its documented contract. Visible tests are examples, not the "
     "complete specification. Inspect EVERY function, including those whose tests pass. For each, infer its "
@@ -114,6 +118,29 @@ def extract_code(content: str) -> str:
     if fenced:
         return max(fenced, key=len).strip()
     return re.sub(r"^```\w*\s*|```\s*$", "", content.strip(), flags=re.MULTILINE).strip()
+
+
+def _math_notes(workspace: Path | None) -> str:
+    if workspace is None or FULL_CONTEXT_CHARS <= 0:
+        return ""
+    limit = min(1500, FULL_CONTEXT_CHARS)
+    try:
+        paths = sorted(workspace.iterdir())
+        if not 1 <= len(paths) <= 4:
+            return ""
+        parts = []
+        for path in paths:
+            if path.is_symlink() or not path.is_file() or path.suffix.lower() not in {".txt", ".md"}:
+                return ""
+            with path.open("rb") as source:
+                data = source.read(limit + 1)
+            limit -= len(data)
+            if limit < 0:
+                return ""
+            parts.append(f"--- {path.name}\n{data.decode('utf-8-sig')}")
+        return "\n".join(parts)
+    except (OSError, UnicodeError):
+        return ""
 
 
 def workspace_context(workspace: Path | None) -> str:
@@ -445,6 +472,7 @@ class LLMFallback:
         self.adaptive_output = adaptive_output
         self._previous_code: dict[Path, str] = {}
         self._contexts: dict[Path, str] = {}
+        self._math_notes: dict[Path, str] = {}
         self._evidence: dict[Path, search_evidence.Evidence | None] = {}
 
     def _search_evidence(self, task: TaskSpec) -> search_evidence.Evidence | None:
@@ -463,6 +491,13 @@ class LLMFallback:
         if task.task_dir not in self._contexts:
             self._contexts[task.task_dir] = workspace_context(task.workspace)
         return self._contexts[task.task_dir]
+
+    def _notes(self, task: TaskSpec) -> str:
+        if task.task_type != "math" or task.workspace is None:
+            return ""
+        if task.task_dir not in self._math_notes:
+            self._math_notes[task.task_dir] = _math_notes(task.workspace)
+        return self._math_notes[task.task_dir]
 
     def _feedback(self, task: TaskSpec, feedback: str) -> str:
         if not feedback:
@@ -494,11 +529,15 @@ class LLMFallback:
             system = search_evidence.LOOKUP_SYSTEM if evidence.focused else search_evidence.SYSTEM
             output = 35 if evidence.focused else (60 if task.check == "exact_str" else 120)
         else:
-            chars = len(prompt) + len(self._context(task))
+            notes = self._notes(task) if attempt == 1 else ""
+            chars = len(prompt) + len(notes or self._context(task))
             if task.task_type == "math":
                 system = MATH_SYSTEM
                 if attempt == 1:
-                    if task.workspace is None and math_checks.stock_calculation(prompt):
+                    if notes:
+                        system = NOTES_SYSTEM
+                        output = 70
+                    elif task.workspace is None and math_checks.stock_calculation(prompt):
                         system = STOCK_SYSTEM
                         output = 20 if math_checks.vague_quantity(prompt) else 70
                     else:
@@ -572,11 +611,14 @@ class LLMFallback:
         stock = (task.task_type == "math" and not final and task.workspace is None
                  and math_checks.stock_calculation(prompt))
         tables = task.task_type == "data_analysis" and not final and csv_query.eligible(task.workspace, prompt)
-        context = self._context(task)
+        notes = self._notes(task) if not final else ""
+        context = notes or self._context(task)
         if context:
             prompt += "\n\n" + context
         prompt += self._feedback(task, feedback)
         system = MATH_SYSTEM if task.task_type == "math" else SCRIPT_SYSTEM
+        if notes:
+            system = NOTES_SYSTEM
         if stock:
             system = STOCK_SYSTEM
             if self.adaptive_output and model.endswith("-noreason"):
