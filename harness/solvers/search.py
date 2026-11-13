@@ -5,21 +5,33 @@ from harness.contracts import SolveResult, TaskSpec
 from harness.solvers._instruction import question_text
 from harness.task_io import resolve_inside
 
-_INTRO = re.compile(
-    r"The directory `?(?P<kb>[\w./-]+)`? contains a (?:small )?knowledge base of "
-    r"markdown files\.\s+(?P<question>.+)", re.IGNORECASE | re.DOTALL,
-)
+_DIRECTORY = r"directory `?(?P<kb>[\w./-]+)`?"
+_BASE = r"a (?:small )?knowledge base"
+_INTROS = [
+    rf"the {_DIRECTORY} (?:contains|holds|is home to) {_BASE} (?:of|made up of|composed of) markdown files",
+    rf"within the {_DIRECTORY}, you will find {_BASE} of markdown files",
+    rf"you can find {_BASE} of markdown files in the {_DIRECTORY}",
+    rf"{_BASE}, composed of markdown files, is located in the {_DIRECTORY}",
+]
+_YEAR = r"In (?:which|what) year was "
+_CITY = r"(?:In which city (?:is|can you find)|What city is home to) the headquarters of "
 _QUERIES = [
-    (r"In which year was (.+) born", ("born",)),
+    (_YEAR + r"(.+)['’]s mentor born", ("mentor", "born")),
+    (_YEAR + r"the mentor of (.+) born", ("mentor", "born")),
+    (_YEAR + r"(.+)['’]s employer founded", ("employer", "founded")),
+    (_YEAR + r"(.+) born", ("born",)),
+    (r"(?:Can you tell me )?the year of birth of (.+)", ("born",)),
     (r"Who is (.+)['’]s mentor", ("mentor",)),
     (r"(?:Who|What) is (.+)['’]s employer", ("employer",)),
-    (r"In which city is the headquarters of (.+)['’]s employer", ("employer", "headquarters")),
-    (r"In which city is the headquarters of (.+)", ("headquarters",)),
-    (r"In which year was (.+) founded", ("founded",)),
+    (r"Which company does (.+) work for", ("employer",)),
+    (_CITY + r"the company that employs (.+)['’]s mentor", ("mentor", "employer", "headquarters")),
+    (_CITY + r"(.+)['’]s employer", ("employer", "headquarters")),
+    (_CITY + r"(.+)", ("headquarters",)),
+    (_YEAR + r"(.+) founded", ("founded",)),
 ]
 _HEADING = re.compile(r"#\s+(.+)")
 _FIELD = re.compile(r"([\w][\w -]*):\s*(\S.*)")
-_ATTRIBUTES = {"born", "mentor", "employer", "headquarters", "founded"}
+_ATTRIBUTES = {"born", "mentor", "employer", "headquarters", "founded", "industry", "role"}
 
 
 def _plain_name(text: str) -> bool:
@@ -60,10 +72,14 @@ def _read_index(kb: Path) -> dict[tuple[str, str], dict[str, str]]:
 
 def solve(task: TaskSpec) -> SolveResult:
     question = question_text(task.instruction)
-    intro = _INTRO.fullmatch(question)
-    directory = intro["kb"] if intro else "kb"
-    if intro:
-        question = intro["question"]
+    directory = "kb"
+    intro = None
+    for description in _INTROS:
+        intro = re.match(description + r"\.\s+", question, re.I)
+        if intro:
+            directory = intro["kb"]
+            question = question[intro.end():]
+            break
     for pattern, attributes in _QUERIES:
         match = re.fullmatch(pattern, question, re.IGNORECASE)
         if match:
