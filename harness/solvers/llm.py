@@ -18,6 +18,7 @@ from harness.contracts import SolveResult, TaskSpec
 from harness.llm_client import LLMClient, LLMError, LLMUnavailable
 from harness.runtime import run_python, run_python_tests
 from harness.scheduler import FallbackRetryLater, FallbackUnavailable
+from harness.solvers import search_evidence
 from harness.solvers.coding import _digest, _literal_calls, _locate, _write_atomic
 from harness.task_io import resolve_inside
 
@@ -399,6 +400,17 @@ class LLMFallback:
         self.adaptive_output = adaptive_output
         self._previous_code: dict[Path, str] = {}
         self._contexts: dict[Path, str] = {}
+        self._evidence: dict[Path, search_evidence.Evidence | None] = {}
+
+    def _search_evidence(self, task: TaskSpec) -> search_evidence.Evidence | None:
+        if task.task_type != "search" or task.check not in ("exact_str", "exact_int"):
+            return None
+        if task.task_dir not in self._evidence:
+            self._evidence[task.task_dir] = search_evidence.Evidence.read(task.workspace, FULL_CONTEXT_CHARS)
+        evidence = self._evidence[task.task_dir]
+        if evidence is not None and task.check == "exact_int" and evidence.has_tables:
+            return None
+        return evidence
 
     def _context(self, task: TaskSpec) -> str:
         if task.task_dir not in self._contexts:
@@ -466,6 +478,16 @@ class LLMFallback:
 
     async def _script(self, task, model, max_tokens, timeout, feedback, *, final) -> SolveResult:
         prompt = question(task.instruction)
+        evidence = None if final else self._search_evidence(task)
+        if evidence is not None:
+            reply = await self._chat(model, search_evidence.SYSTEM, prompt + "\n\n" + evidence.prompt,
+                                     max_tokens, timeout, task.task_id)
+            answer = None if reply.finish_reason == "length" else evidence.answer(reply.content, task.check, prompt)
+            if answer is None and task.check == "exact_str" and reply.finish_reason != "length":
+                answer = _grounded_search_answer(reply.content, self._context(task))
+            if answer is not None and normalize_answer(answer, task.check) is not None:
+                return SolveResult.solved(answer, f"{model} selected source evidence")
+            return SolveResult.unsupported("source lines did not establish an answer; solve from the files")
         context = self._context(task)
         if context:
             prompt += "\n\n" + context
