@@ -13,14 +13,15 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-deps -r requirements.txt
+RUN mkdir /tmp/wheels \
+    && xargs -n 20 -P 4 python -m pip download --only-binary=:all: --no-deps --dest /tmp/wheels < requirements.txt \
+    && python -m pip install --no-index --find-links=/tmp/wheels --no-deps -r requirements.txt \
+    && rm -rf /tmp/wheels
 
 COPY run_agent.py .
 COPY harness ./harness
+RUN python -m compileall -q /app && python -m harness.smoke
 
-RUN python -m compileall -q /app /usr/local/lib/python3.11/site-packages \
-    && python -m harness.smoke
 ENV PYTHONDONTWRITEBYTECODE=1
-
 ENTRYPOINT ["python", "/app/run_agent.py"]
 CMD ["--tasks-dir", "/data/tasks"]
