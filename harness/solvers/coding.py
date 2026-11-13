@@ -17,6 +17,7 @@ from queue import SimpleQueue
 
 from harness.contracts import SolveResult, TaskSpec
 from harness.runtime import TestResult, run_python, run_python_tests
+from harness.solvers import shape_repairs
 from harness.solvers.defaults import isolated_defaults
 from harness.task_io import resolve_inside
 
@@ -737,6 +738,8 @@ def precheck(task: TaskSpec) -> SolveResult:
                 path = resolve_inside(task.workspace, target)
                 original = path.read_bytes()
                 candidate = isolated_defaults(original)
+                shaped = shape_repairs.candidate(candidate or original, test_source)
+                candidate = shaped or candidate
                 if candidate is not None:
                     (root / target).write_bytes(candidate)
                     patches[path] = (original, candidate)
@@ -750,7 +753,7 @@ def precheck(task: TaskSpec) -> SolveResult:
                     check = run_python_tests(task, script, timeout=PRECHECK_TIMEOUT)
                     accepted = check.passed and resolve_inside(task.workspace, script).read_bytes() == test_source
                     if accepted:
-                        return SolveResult.solved("DONE", "isolated mutable defaults; original tests pass in place")
+                        return SolveResult.solved("DONE", "local source repair; original tests pass in place")
                 finally:
                     if not accepted:
                         for path, original in reversed(written):
@@ -769,48 +772,62 @@ def solve(task: TaskSpec) -> SolveResult:
         if isinstance(located, SolveResult):
             return located
         script, targets = located
-        target = targets[0]
-        target_path = resolve_inside(task.workspace, target)
         script_path = resolve_inside(task.workspace, script)
-        original = target_path.read_bytes()
         test_source = script_path.read_bytes()
         script_digest = _digest(script_path)
+        sources = {name: resolve_inside(task.workspace, name).read_bytes() for name in targets}
     except (OSError, ValueError) as error:
         return SolveResult.error(f"cannot prepare coding task: {error}")
 
-    contradiction = _contradiction(test_source, original, ".".join(Path(target).with_suffix("").parts))
-    if contradiction:
-        return SolveResult.unsolvable(f"the tests contradict each other: {contradiction}")
-    bom = codecs.BOM_UTF8 if original.startswith(codecs.BOM_UTF8) else b""
-    body = original[len(bom):]
-    module = ".".join(Path(target).with_suffix("").parts)
-    try:
-        with tempfile.TemporaryDirectory(prefix="jiuwen-coding-") as scratch:
-            bench = _Bench(task, target, script, Path(scratch), deadline)
-            try:
-                found = _search(bench, body, test_source, module)
-            except Ambiguous as error:
-                return SolveResult.unsupported(f"ambiguous repair: {error}")
-            finally:
-                bench.close()
-    except OSError as error:
-        return SolveResult.error(f"cannot evaluate repairs: {error}")
-    if found is None:
-        return SolveResult.unsupported(f"no verified repair within limits after {bench.runs} test runs")
+    for name, original in sources.items():
+        module = ".".join(Path(name).with_suffix("").parts)
+        if contradiction := _contradiction(test_source, original, module):
+            return SolveResult.unsolvable(f"the tests contradict each other: {contradiction}")
+    runs = 0
+    ambiguous = None
+    for index, (target, original) in enumerate(sources.items()):
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        cutoff = now + (deadline - now) / (len(sources) - index)
+        bom = codecs.BOM_UTF8 if original.startswith(codecs.BOM_UTF8) else b""
+        body = original[len(bom):]
+        module = ".".join(Path(target).with_suffix("").parts)
+        try:
+            with tempfile.TemporaryDirectory(prefix="jiuwen-coding-") as scratch:
+                bench = _Bench(task, target, script, Path(scratch), cutoff)
+                try:
+                    found = _search(bench, body, test_source, module)
+                except Ambiguous as error:
+                    ambiguous = str(error)
+                    found = None
+                finally:
+                    bench.close()
+                    runs += bench.runs
+        except OSError as error:
+            return SolveResult.error(f"cannot evaluate repairs: {error}")
+        if found is not None:
+            target_path = resolve_inside(task.workspace, target)
+            return _verify_repair(task, target_path, original, bom, found, script, script_digest, runs)
+    if ambiguous:
+        return SolveResult.unsupported(f"ambiguous repair: {ambiguous}")
+    return SolveResult.unsupported(f"no verified repair within limits after {runs} test runs")
 
+
+def _verify_repair(task, target_path, original, bom, found, script, script_digest, runs):
     repaired, applied = found
     accepted = False
     try:
-        if repaired != body:
+        if bom + repaired != original:
             _write_atomic(target_path, bom + repaired)
-        result = run_python_tests(task, script, timeout=max(bench.timeout, 10.0))
-        if not result.passed or _digest(script_path) != script_digest:
+        result = run_python_tests(task, script, timeout=10.0)
+        if not result.passed or _digest(resolve_inside(task.workspace, script)) != script_digest:
             return SolveResult.unsupported("repair did not pass the original tests in place; restored")
         accepted = True
     except (OSError, ValueError) as error:
         return SolveResult.error(f"cannot apply repair: {error}")
     finally:
-        if not accepted and repaired != body:
+        if not accepted and bom + repaired != original:
             _write_atomic(target_path, original)
     detail = "; ".join(applied) if applied else "original tests already pass"
-    return SolveResult.solved("DONE", f"{detail} ({bench.runs} test runs)")
+    return SolveResult.solved("DONE", f"{detail} ({runs} test runs)")
