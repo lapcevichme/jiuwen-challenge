@@ -82,6 +82,31 @@ def _load(db, path):
     db.executemany(f'INSERT INTO "{path.stem}" VALUES ({slots})', ([v or None for v in row] for row in rows))
 
 
+_SQL_TOKEN = re.compile(r"""'(?:''|[^'])*'|"(?:""|[^"])*"|`[^`]*`|\[[^\]]*\]|--[^\n]*|/\*.*?\*/|[\w$]+|\s+|.""", re.S)
+
+
+def _file_references(query: str, names: tuple[str, ...]) -> str:
+    by_name = {name.casefold(): Path(name).stem for name in names}
+    tokens = _SQL_TOKEN.findall(query)
+    for i, token in enumerate(tokens):
+        if token.upper() not in {"FROM", "JOIN"}:
+            continue
+        j = i + 1
+        while j < len(tokens) and tokens[j].isspace():
+            j += 1
+        if j == len(tokens):
+            continue
+        end = j + 1
+        if end + 1 < len(tokens) and tokens[end] == ".":
+            end += 2
+        name = "".join(tokens[j:end])
+        if name[:1] in {'"', "`", "["}:
+            name = name[1:-1]
+        if stem := by_name.get(name.casefold()):
+            tokens[j:end] = [f'"{stem}"'] + [""] * (end - j - 1)
+    return "".join(tokens)
+
+
 def scalar(root: Path, query: str):
     names = files(root)
     if not names or not re.match(r"(?:SELECT|WITH)\b", query.strip(), re.I):
@@ -110,7 +135,16 @@ def scalar(root: Path, query: str):
         db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_BYTES)
         db.set_authorizer(authorize)
         db.set_progress_handler(lambda: 1, 2_000_000)
-        rows = db.execute(query).fetchmany(2)
+        try:
+            cursor = db.execute(query)
+        except sqlite3.OperationalError as error:
+            if "no such table:" not in str(error):
+                raise
+            corrected = _file_references(query, names)
+            if corrected == query:
+                raise
+            cursor = db.execute(corrected)
+        rows = cursor.fetchmany(2)
         if not read_table or len(rows) != 1 or len(rows[0]) != 1 or rows[0][0] is None:
             raise ValueError("query must return one non-null cell from the data")
         value = rows[0][0]
